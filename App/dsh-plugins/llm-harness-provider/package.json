@@ -1,0 +1,33 @@
+{
+  "name": "@harness/dsh-llm-harness-provider",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AI Harness model routes: OpenAI-compatible providers declared by the workspace models document",
+  "type": "module",
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./package.json": "./package.json"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-credentials": "*",
+    "@deepseek-ai/dsh-launch-environment": "*",
+    "@deepseek-ai/dsh-llm": "*",
+    "@deepseek-ai/dsh-llm-pi-ai": "*",
+    "@deepseek-ai/schemastery": "*"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "link:../../../Deepseek/deepseek-harness/vendor/cordis",
+    "@deepseek-ai/dsh-credentials": "link:../../../Deepseek/deepseek-harness/packages/credentials/credentials",
+    "@deepseek-ai/dsh-launch-environment": "link:../../../Deepseek/deepseek-harness/packages/util/launch-environment",
+    "@deepseek-ai/dsh-llm": "link:../../../Deepseek/deepseek-harness/packages/llm/llm",
+    "@deepseek-ai/dsh-llm-pi-ai": "link:../../../Deepseek/deepseek-harness/packages/llm/llm-pi-ai",
+    "@deepseek-ai/schemastery": "link:../../../Deepseek/deepseek-harness/vendor/schemastery",
+    "tsx": "link:../../../Deepseek/deepseek-harness/node_modules/tsx"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "node --import tsx/esm --test tests/*.test.ts"
+  }
+}

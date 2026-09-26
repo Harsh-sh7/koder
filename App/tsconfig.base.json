@@ -1,0 +1,25 @@
+{
+  // Our packages are *consumers* of the dsh workspace, not part of its build:
+  // the harness loads our TypeScript sources through tsx at run time, so a
+  // plugin here is typechecked against the declarations the dsh workspace
+  // published (`lib/types`), and nothing of ours ever enters dsh's own
+  // projects. Sharing the repository's base settings keeps the language rules
+  // identical — strict, `exactOptionalPropertyTypes`, bundler resolution — so
+  // code accepted here would be accepted there.
+  //
+  // `paths` is deliberately empty rather than inherited: the repository's facade
+  // points `@deepseek-ai/*` at its *sources*, and those sources only typecheck
+  // under the relaxed flags their own `vendor/*/tsconfig.json` files set. Our
+  // packages reach the packages they declare through the links in
+  // `node_modules`, which resolve each package's published `types`.
+  "extends": "../Deepseek/deepseek-harness/tsconfig.base.json",
+  "compilerOptions": {
+    "paths": {},
+    // These are checked, not built: the harness loads their sources through tsx.
+    "composite": false,
+    "declaration": false,
+    "declarationMap": false,
+    "incremental": false,
+    "noEmit": true
+  }
+}

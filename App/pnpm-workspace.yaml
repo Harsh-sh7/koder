@@ -1,0 +1,7 @@
+# Our plugin packages are checked, not installed: the harness loads their
+# sources through tsx and resolves `@deepseek-ai/*` through the dsh repository's
+# path facade, so no peer (cordis, the seams, schemastery) is fetched here.
+packages:
+  - dsh-plugins/*
+
+autoInstallPeers: false

@@ -1,0 +1,55 @@
+{
+  "name": "@harness/dsh-hackathon-harness-preset",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AI Harness composition: the model-route contract, the wave/committee orchestration policy, and the hard budget cap",
+  "type": "module",
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./cordis.yml": "./cordis.yml",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-agent": "*",
+    "@deepseek-ai/dsh-brand": "*",
+    "@deepseek-ai/dsh-llm": "*",
+    "@deepseek-ai/dsh-session": "*",
+    "@deepseek-ai/dsh-session-projection": "*",
+    "@deepseek-ai/dsh-skill": "*",
+    "@deepseek-ai/dsh-subagent": "*",
+    "@deepseek-ai/dsh-system-prompt": "*",
+    "@deepseek-ai/dsh-token-meter": "*",
+    "@deepseek-ai/dsh-tools": "*",
+    "@deepseek-ai/dsh-user-approval": "*",
+    "@deepseek-ai/schemastery": "*",
+    "zod": "*"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "link:../../../Deepseek/deepseek-harness/vendor/cordis",
+    "@deepseek-ai/dsh-agent": "link:../../../Deepseek/deepseek-harness/packages/core/agent",
+    "@deepseek-ai/dsh-brand": "link:../../../Deepseek/deepseek-harness/packages/util/brand",
+    "@deepseek-ai/dsh-llm": "link:../../../Deepseek/deepseek-harness/packages/llm/llm",
+    "@deepseek-ai/dsh-session": "link:../../../Deepseek/deepseek-harness/packages/core/session",
+    "@deepseek-ai/dsh-session-projection": "link:../../../Deepseek/deepseek-harness/packages/session/session-projection",
+    "@deepseek-ai/dsh-skill": "link:../../../Deepseek/deepseek-harness/packages/skill/skill",
+    "@deepseek-ai/dsh-subagent": "link:../../../Deepseek/deepseek-harness/packages/subagent/subagent",
+    "@deepseek-ai/dsh-system-prompt": "link:../../../Deepseek/deepseek-harness/packages/core/system-prompt",
+    "@deepseek-ai/dsh-token-meter": "link:../../../Deepseek/deepseek-harness/packages/llm/token-meter",
+    "@deepseek-ai/dsh-tools": "link:../../../Deepseek/deepseek-harness/packages/core/tools",
+    "@deepseek-ai/dsh-user-approval": "link:../../../Deepseek/deepseek-harness/packages/interaction/user-approval",
+    "@deepseek-ai/schemastery": "link:../../../Deepseek/deepseek-harness/vendor/schemastery",
+    "tsx": "link:../../../Deepseek/deepseek-harness/node_modules/tsx",
+    "zod": "link:../../../Deepseek/deepseek-harness/node_modules/.pnpm/zod@4.4.3/node_modules/zod"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "node --import tsx/esm --test tests/*.test.ts"
+  }
+}

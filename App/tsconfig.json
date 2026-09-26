@@ -1,0 +1,5 @@
+{
+  // Checks every dsh plugin in this workspace against the shared facade.
+  "extends": "./tsconfig.base.json",
+  "include": ["dsh-plugins/*/src/**/*.ts", "dsh-plugins/*/tests/**/*.ts"]
+}

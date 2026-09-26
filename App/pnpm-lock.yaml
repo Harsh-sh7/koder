@@ -1,0 +1,144 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: false
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.0
+        version: 22.20.4
+      typescript:
+        specifier: ^5.7.0
+        version: 5.9.3
+
+  dsh-plugins/hackathon-harness-preset:
+    devDependencies:
+      '@deepseek-ai/cordis':
+        specifier: link:../../../Deepseek/deepseek-harness/vendor/cordis
+        version: link:../../../Deepseek/deepseek-harness/vendor/cordis
+      '@deepseek-ai/dsh-agent':
+        specifier: link:../../../Deepseek/deepseek-harness/packages/core/agent
+        version: link:../../../Deepseek/deepseek-harness/packages/core/agent
+      '@deepseek-ai/dsh-brand':
+        specifier: link:../../../Deepseek/deepseek-harness/packages/util/brand
+        version: link:../../../Deepseek/deepseek-harness/packages/util/brand
+      '@deepseek-ai/dsh-llm':
+        specifier: link:../../../Deepseek/deepseek-harness/packages/llm/llm
+        version: link:../../../Deepseek/deepseek-harness/packages/llm/llm
+      '@deepseek-ai/dsh-session':
+        specifier: link:../../../Deepseek/deepseek-harness/packages/core/session
+        version: link:../../../Deepseek/deepseek-harness/packages/core/session
+      '@deepseek-ai/dsh-session-projection':
+        specifier: link:../../../Deepseek/deepseek-harness/packages/session/session-projection
+        version: link:../../../Deepseek/deepseek-harness/packages/session/session-projection
+      '@deepseek-ai/dsh-skill':
+        specifier: link:../../../Deepseek/deepseek-harness/packages/skill/skill
+        version: link:../../../Deepseek/deepseek-harness/packages/skill/skill
+      '@deepseek-ai/dsh-subagent':
+        specifier: link:../../../Deepseek/deepseek-harness/packages/subagent/subagent
+        version: link:../../../Deepseek/deepseek-harness/packages/subagent/subagent
+      '@deepseek-ai/dsh-system-prompt':
+        specifier: link:../../../Deepseek/deepseek-harness/packages/core/system-prompt
+        version: link:../../../Deepseek/deepseek-harness/packages/core/system-prompt
+      '@deepseek-ai/dsh-token-meter':
+        specifier: link:../../../Deepseek/deepseek-harness/packages/llm/token-meter
+        version: link:../../../Deepseek/deepseek-harness/packages/llm/token-meter
+      '@deepseek-ai/dsh-tools':
+        specifier: link:../../../Deepseek/deepseek-harness/packages/core/tools
+        version: link:../../../Deepseek/deepseek-harness/packages/core/tools
+      '@deepseek-ai/dsh-user-approval':
+        specifier: link:../../../Deepseek/deepseek-harness/packages/interaction/user-approval
+        version: link:../../../Deepseek/deepseek-harness/packages/interaction/user-approval
+      '@deepseek-ai/schemastery':
+        specifier: link:../../../Deepseek/deepseek-harness/vendor/schemastery
+        version: link:../../../Deepseek/deepseek-harness/vendor/schemastery
+      tsx:
+        specifier: link:../../../Deepseek/deepseek-harness/node_modules/tsx
+        version: link:../../../Deepseek/deepseek-harness/node_modules/tsx
+      zod:
+        specifier: link:../../../Deepseek/deepseek-harness/node_modules/.pnpm/zod@4.4.3/node_modules/zod
+        version: link:../../../Deepseek/deepseek-harness/node_modules/.pnpm/zod@4.4.3/node_modules/zod
+
+  dsh-plugins/llm-harness-provider:
+    devDependencies:
+      '@deepseek-ai/cordis':
+        specifier: link:../../../Deepseek/deepseek-harness/vendor/cordis
+        version: link:../../../Deepseek/deepseek-harness/vendor/cordis
+      '@deepseek-ai/dsh-credentials':
+        specifier: link:../../../Deepseek/deepseek-harness/packages/credentials/credentials
+        version: link:../../../Deepseek/deepseek-harness/packages/credentials/credentials
+      '@deepseek-ai/dsh-launch-environment':
+        specifier: link:../../../Deepseek/deepseek-harness/packages/util/launch-environment
+        version: link:../../../Deepseek/deepseek-harness/packages/util/launch-environment
+      '@deepseek-ai/dsh-llm':
+        specifier: link:../../../Deepseek/deepseek-harness/packages/llm/llm
+        version: link:../../../Deepseek/deepseek-harness/packages/llm/llm
+      '@deepseek-ai/dsh-llm-pi-ai':
+        specifier: link:../../../Deepseek/deepseek-harness/packages/llm/llm-pi-ai
+        version: link:../../../Deepseek/deepseek-harness/packages/llm/llm-pi-ai
+      '@deepseek-ai/schemastery':
+        specifier: link:../../../Deepseek/deepseek-harness/vendor/schemastery
+        version: link:../../../Deepseek/deepseek-harness/vendor/schemastery
+      tsx:
+        specifier: link:../../../Deepseek/deepseek-harness/node_modules/tsx
+        version: link:../../../Deepseek/deepseek-harness/node_modules/tsx
+
+  dsh-plugins/spec-lock:
+    devDependencies:
+      '@deepseek-ai/cordis':
+        specifier: link:../../../Deepseek/deepseek-harness/vendor/cordis
+        version: link:../../../Deepseek/deepseek-harness/vendor/cordis
+      '@deepseek-ai/dsh-agent':
+        specifier: link:../../../Deepseek/deepseek-harness/packages/core/agent
+        version: link:../../../Deepseek/deepseek-harness/packages/core/agent
+      '@deepseek-ai/dsh-llm':
+        specifier: link:../../../Deepseek/deepseek-harness/packages/llm/llm
+        version: link:../../../Deepseek/deepseek-harness/packages/llm/llm
+      '@deepseek-ai/dsh-session':
+        specifier: link:../../../Deepseek/deepseek-harness/packages/core/session
+        version: link:../../../Deepseek/deepseek-harness/packages/core/session
+      '@deepseek-ai/dsh-session-projection':
+        specifier: link:../../../Deepseek/deepseek-harness/packages/session/session-projection
+        version: link:../../../Deepseek/deepseek-harness/packages/session/session-projection
+      '@deepseek-ai/dsh-tools':
+        specifier: link:../../../Deepseek/deepseek-harness/packages/core/tools
+        version: link:../../../Deepseek/deepseek-harness/packages/core/tools
+      '@deepseek-ai/dsh-user-approval':
+        specifier: link:../../../Deepseek/deepseek-harness/packages/interaction/user-approval
+        version: link:../../../Deepseek/deepseek-harness/packages/interaction/user-approval
+      '@deepseek-ai/schemastery':
+        specifier: link:../../../Deepseek/deepseek-harness/vendor/schemastery
+        version: link:../../../Deepseek/deepseek-harness/vendor/schemastery
+      tsx:
+        specifier: link:../../../Deepseek/deepseek-harness/node_modules/tsx
+        version: link:../../../Deepseek/deepseek-harness/node_modules/tsx
+      zod:
+        specifier: link:../../../Deepseek/deepseek-harness/node_modules/.pnpm/zod@4.4.3/node_modules/zod
+        version: link:../../../Deepseek/deepseek-harness/node_modules/.pnpm/zod@4.4.3/node_modules/zod
+
+packages:
+
+  '@types/node@22.20.4':
+    resolution: {integrity: sha512-zJRE40jpHtKqE/C4fgHrAKQLJuSpzEnP9ff9Y7YtoR3Wd2pwqzlekDeEuUQXjRd+QCYnVnNwuJYmhdk9XV8gvA==}
+
+  typescript@5.9.3:
+    resolution: {integrity: sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==}
+    engines: {node: '>=14.17'}
+    hasBin: true
+
+  undici-types@6.21.0:
+    resolution: {integrity: sha512-iwDZqg0QAGrg9Rav5H4n0M64c3mkR59cJ6wQp+7C4nI0gsmExaedaYLNO44eT4AtBBwjbTiGPMlt2Md0T9H9JQ==}
+
+snapshots:
+
+  '@types/node@22.20.4':
+    dependencies:
+      undici-types: 6.21.0
+
+  typescript@5.9.3: {}
+
+  undici-types@6.21.0: {}

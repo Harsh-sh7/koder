@@ -1,0 +1,9 @@
+# Live probe of the budget escalation path: a ceiling so low that the session
+# crosses it on its first request, an approved grant, and a ceiling that has to
+# be respected again. Applied as an overlay (`--patch`) over the harness bundle,
+# because that is the deployment path a real workspace uses — no source edit.
+- id: harness-preset
+  config:
+    maxTokens: 1
+    grantTokens: 5000
+    maxEscalations: 1

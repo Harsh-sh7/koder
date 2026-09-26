@@ -1,0 +1,16 @@
+{
+  "name": "ai-harness-app",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "AI Harness — our own code. dsh plugins (the agent brain) and the native Rust app (the interface).",
+  "scripts": {
+    "typecheck": "pnpm -r --filter \"./dsh-plugins/*\" run typecheck",
+    "test": "pnpm -r --filter \"./dsh-plugins/*\" run test",
+    "clean": "pnpm -r exec rm -rf lib dist *.tsbuildinfo"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}

@@ -1,0 +1,79 @@
+# The AI Harness composition, as one bundle layer.
+#
+# A profile selects this package in its `dsh.profile.bundles`, so this file is
+# applied after the base and ACP bundles and before the profile's own
+# cordis.patch.yml — and the application's per-session overlay after that. Every
+# row below therefore stays overridable without editing this file.
+#
+# Two decisions live here:
+#
+# 1. Route ownership. Every model route comes from the workspace models document
+#    (`.harness/models.json`) through this repository's provider plugin, so the
+#    shipped DeepSeek routes are mounted off. Adding a model in the application
+#    is then the only way a route appears, and `AI_API_KEY` — the key the
+#    workspace declares — is the only credential any route can read.
+# 2. The harness itself: the frozen session spec, the operating contract, the
+#    wave/committee tools, and the budget the harness enforces rather than the
+#    model.
+#
+# Environment overrides, for a deployment that must not edit source:
+#   AI_HARNESS_FALLBACK_MODEL / AI_HARNESS_FALLBACK_BASE_URL — declare a fallback
+#   route for a workspace nobody has configured yet. Left unset (the default),
+#   the harness ships no model at all: the application is where one is added.
+
+- id: llm-pi-ai
+  disabled: true
+- id: llm-deepseek
+  disabled: true
+- id: llm-deepseek-account
+  disabled: true
+- id: deepseek-llm-api-extensions
+  disabled: true
+- id: deepseek-account
+  disabled: true
+# Both read the extension service above; with the official route gone they wait
+# forever, which the boot reports as entries that never activated.
+- id: session-log-deepseek
+  disabled: true
+- id: plugin-package-inventory-deepseek
+  disabled: true
+
+- insert:
+    # The single route source. The document is re-read when its bytes change, so
+    # a model added in the application reaches the next request without a restart.
+    - id: llm-harness
+      name: '@harness/dsh-llm-harness-provider'
+      config:
+        modelsFile: .harness/models.json
+        apiKeyEnv: AI_API_KEY
+        # Both variables or neither: a model id with no endpoint, or the reverse,
+        # is a half-declared route and half-declared routes fail loud.
+        defaultRoute: !!js "process.env.AI_HARNESS_FALLBACK_MODEL && process.env.AI_HARNESS_FALLBACK_BASE_URL ? { displayName: process.env.AI_HARNESS_FALLBACK_MODEL, baseURL: process.env.AI_HARNESS_FALLBACK_BASE_URL, model: process.env.AI_HARNESS_FALLBACK_MODEL } : undefined"
+
+    # The session's opening instruction stays frozen: restated whenever context
+    # management drops it, amendable only with the user's approval, and readable
+    # in full through spec_get while a long spec travels as one pointer line.
+    - id: spec-lock
+      name: '@harness/dsh-spec-lock'
+
+    # The harness: contract, wave/committee orchestration, and the budget cap.
+    # The values are this deployment's; every one of them is overridable from a
+    # profile patch or an overlay without touching this file.
+    - id: harness-preset
+      name: '@harness/dsh-hackathon-harness-preset'
+      config:
+        # Model tokens one session may spend before the harness stops it, and the
+        # fraction at which it warns the model once. The warning is the useful
+        # half: it tells the model to land the subtask in flight.
+        maxTokens: 400000
+        warnAt: 0.8
+        # Steps one turn may take, so a runaway loop is bounded even when nothing
+        # it reads is expensive.
+        stepsPerTurn: 60
+        # Approved escalations past the ceiling, and the tokens each one buys.
+        maxEscalations: 2
+        grantTokens: 200000
+        # Reviewers are seated as fresh children: a fork would hand every reviewer
+        # the parent's whole context, and paying for that context three times is
+        # exactly the cost the committee exists to avoid.
+        committeeProvider: spawn

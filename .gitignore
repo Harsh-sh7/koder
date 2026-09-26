@@ -1,0 +1,31 @@
+# Vendored upstream checkouts — never committed; restored from upstream or shipped alongside.
+WARP/
+Deepseek/
+
+# Secrets
+.env
+
+# Local harness state (dsh home, sessions, logs, workflows)
+.dsh/
+.harness/
+
+# Node
+node_modules/
+dist/
+*.tsbuildinfo
+
+# The interpreter `make setup` installs when the machine has none new enough
+# for dsh (see App/scripts/provision-node.sh): ~50 MB per platform, so it is
+# fetched, never committed.
+.toolchain/
+
+# Rust
+target/
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp

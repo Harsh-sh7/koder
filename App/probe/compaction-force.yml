@@ -1,0 +1,8 @@
+# Probe-only overlay: shrink the compaction pressure budget so one short turn
+# already exceeds it, and the next step compacts the opening region away.
+# A real deployment keeps the shipped defaults (0.8 / 65536 / 0.16).
+- id: compaction-basic
+  config:
+    thresholdRatio: 0.01
+    headroomTokens: 1000
+    retainRatio: 0.001

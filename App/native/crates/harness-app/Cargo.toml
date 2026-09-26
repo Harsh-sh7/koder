@@ -1,0 +1,23 @@
+[package]
+name = "harness-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native egui interface of the AI Harness."
+
+[[bin]]
+name = "ai-harness"
+path = "src/main.rs"
+
+[dependencies]
+harness-core = { path = "../harness-core" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+env_logger.workspace = true
+crossbeam-channel = "0.5.17"
+eframe = { version = "0.36.2", default-features = false, features = ["wgpu", "default_fonts"] }
+egui_extras = "0.36.2"
+rfd = "0.17.2"
+chrono = "0.4.45"

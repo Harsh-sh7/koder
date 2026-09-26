@@ -1,0 +1,39 @@
+{
+  "name": "@harness/dsh-spec-lock",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Spec lock: the session's opening instruction stays frozen and visible wherever context management would otherwise drop it",
+  "type": "module",
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./package.json": "./package.json"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-agent": "*",
+    "@deepseek-ai/dsh-llm": "*",
+    "@deepseek-ai/dsh-session": "*",
+    "@deepseek-ai/dsh-session-projection": "*",
+    "@deepseek-ai/dsh-tools": "*",
+    "@deepseek-ai/dsh-user-approval": "*",
+    "@deepseek-ai/schemastery": "*",
+    "zod": "*"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "link:../../../Deepseek/deepseek-harness/vendor/cordis",
+    "@deepseek-ai/dsh-agent": "link:../../../Deepseek/deepseek-harness/packages/core/agent",
+    "@deepseek-ai/dsh-llm": "link:../../../Deepseek/deepseek-harness/packages/llm/llm",
+    "@deepseek-ai/dsh-session": "link:../../../Deepseek/deepseek-harness/packages/core/session",
+    "@deepseek-ai/dsh-session-projection": "link:../../../Deepseek/deepseek-harness/packages/session/session-projection",
+    "@deepseek-ai/dsh-tools": "link:../../../Deepseek/deepseek-harness/packages/core/tools",
+    "@deepseek-ai/dsh-user-approval": "link:../../../Deepseek/deepseek-harness/packages/interaction/user-approval",
+    "@deepseek-ai/schemastery": "link:../../../Deepseek/deepseek-harness/vendor/schemastery",
+    "tsx": "link:../../../Deepseek/deepseek-harness/node_modules/tsx",
+    "zod": "link:../../../Deepseek/deepseek-harness/node_modules/.pnpm/zod@4.4.3/node_modules/zod"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "node --import tsx/esm --test tests/*.test.ts"
+  }
+}

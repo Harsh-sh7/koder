@@ -1,0 +1,8 @@
+# Live probe of the stop path: the same low ceiling, but the session has no
+# escalation left, so the harness must end the turn itself. An ACP client that
+# answers permission requests still sees nothing asked — `maxEscalations: 0`
+# means the escalation is not offered, not that it was declined.
+- id: harness-preset
+  config:
+    maxTokens: 1
+    maxEscalations: 0
