@@ -505,3 +505,108 @@ test('harness_report never writes anything and never changes the budget it repor
   const second = await tool.execute({}, { agent: { session } as unknown as Agent, signal: new AbortController().signal } as never)
   assert.deepEqual(first, second)
 })
+
+test('maxConcurrentParts caps how many of a wave\'s parts ever run at the same instant', async () => {
+  // This is the actual shape of "subagents always fail" on a small free-tier
+  // route: four file-disjoint parts are one wave and the harness used to seat
+  // all four at once (just staggered by milliseconds) — fine for a route with
+  // headroom, but on an account whose real per-minute cap is smaller than what
+  // even two full-size parts ask for, every one of the four fails together,
+  // no matter how they are retried, because the wave asked for more in one
+  // minute than the account could ever serve. Capping concurrency is the only
+  // fix that changes how much the wave asks for, rather than just how it asks.
+  const { ctx } = await harness({ partStartStaggerMs: 0, maxConcurrentParts: 2, interBatchDelayMs: 0 })
+  let live = 0
+  let peak = 0
+  ctx.provide('subagents', {
+    start: async (_provider: string, request: { label: string }) => {
+      live += 1
+      peak = Math.max(peak, live)
+      return {
+        id: `child-${request.label}`,
+        localAgent: undefined,
+        result: (async () => {
+          await new Promise(resolve => setTimeout(resolve, 5))
+          live -= 1
+          return { output: [], stopReason: 'completed', structured: { status: 'done', summary: `${request.label} ok.` } }
+        })(),
+        dispose: async () => {},
+      }
+    },
+  } as never)
+  const tool = ctx.tools.get(RUN_WAVE)
+  assert.ok(tool !== undefined)
+  const session = ctx.sessions.create(SessionId('capped-concurrency'))
+  const value = await tool.execute({
+    parts: [
+      { id: 'core', task: 'a', files: ['a.py'] },
+      { id: 'tests', task: 'b', files: ['b.py'] },
+      { id: 'docs', task: 'c', files: ['c.py'] },
+      { id: 'polish', task: 'd', files: ['d.py'] },
+    ],
+  }, { agent: { session } as unknown as Agent, signal: new AbortController().signal } as never) as {
+    parts: { id: string; status: string }[]
+  }
+  assert.equal(peak, 2, 'never more than maxConcurrentParts children were live at once')
+  assert.equal(value.parts.filter(part => part.status === 'done').length, 4, 'every part still ran, just in two batches')
+})
+
+test('a wave split into batches waits interBatchDelayMs between them', async () => {
+  const { ctx } = await harness({ partStartStaggerMs: 0, maxConcurrentParts: 1, interBatchDelayMs: 30 })
+  const starts: number[] = []
+  ctx.provide('subagents', {
+    start: async () => {
+      starts.push(Date.now())
+      return {
+        id: 'child',
+        localAgent: undefined,
+        result: Promise.resolve({ output: [], stopReason: 'completed', structured: { status: 'done', summary: 'ok.' } }),
+        dispose: async () => {},
+      }
+    },
+  } as never)
+  const tool = ctx.tools.get(RUN_WAVE)
+  assert.ok(tool !== undefined)
+  const session = ctx.sessions.create(SessionId('batch-delay'))
+  await tool.execute({
+    parts: [
+      { id: 'core', task: 'a', files: ['a.py'] },
+      { id: 'tests', task: 'b', files: ['b.py'] },
+    ],
+  }, { agent: { session } as unknown as Agent, signal: new AbortController().signal } as never)
+  assert.equal(starts.length, 2)
+  assert.ok(starts[1]! - starts[0]! >= 25, `the second batch must wait roughly interBatchDelayMs (${String(starts[1]! - starts[0]!)}ms elapsed)`)
+})
+
+test('maxConcurrentParts left at its default (0) keeps the whole wave as one batch, exactly as before', async () => {
+  const { ctx } = await harness({ partStartStaggerMs: 0 })
+  let live = 0
+  let peak = 0
+  ctx.provide('subagents', {
+    start: async () => {
+      live += 1
+      peak = Math.max(peak, live)
+      return {
+        id: `child-${String(live)}`,
+        localAgent: undefined,
+        result: (async () => {
+          await new Promise(resolve => setTimeout(resolve, 5))
+          live -= 1
+          return { output: [], stopReason: 'completed', structured: { status: 'done', summary: 'ok.' } }
+        })(),
+        dispose: async () => {},
+      }
+    },
+  } as never)
+  const tool = ctx.tools.get(RUN_WAVE)
+  assert.ok(tool !== undefined)
+  const session = ctx.sessions.create(SessionId('default-concurrency'))
+  await tool.execute({
+    parts: [
+      { id: 'core', task: 'a', files: ['a.py'] },
+      { id: 'tests', task: 'b', files: ['b.py'] },
+      { id: 'docs', task: 'c', files: ['c.py'] },
+    ],
+  }, { agent: { session } as unknown as Agent, signal: new AbortController().signal } as never)
+  assert.equal(peak, 3, 'no cap configured — the whole wave still runs at once, unchanged from before')
+})

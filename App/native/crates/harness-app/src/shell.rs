@@ -821,16 +821,9 @@ fn footer_row(state: &mut HarnessState, ui: &mut Ui) {
         .filter(|name| !name.is_empty());
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
-        let folder = chip(ui, Icon::Folder, &shorten(&name, 28));
-        if folder
-            .on_hover_text(format!(
-                "{} — click to open a different folder",
-                state.root.display()
-            ))
-            .clicked()
-        {
-            state.open_folder_dialog();
-        }
+        // Status only: opening another folder is the composer's folder mark
+        // now, so this chip is not a second, differently-shaped way to do it.
+        chip(ui, Icon::Folder, &shorten(&name, 28)).on_hover_text(state.root.display().to_string());
         ui.add_space(8.0);
         let local = chip(ui, Icon::Window, "Local");
         let engine = running_engine(state);

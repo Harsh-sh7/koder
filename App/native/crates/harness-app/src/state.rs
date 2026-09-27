@@ -3928,6 +3928,22 @@ mod tests {
     }
 
     #[test]
+    fn opening_a_file_populates_the_relative_name_the_composer_chip_reads() {
+        // The composer shows "editing: <name>" from `editor.buffer.relative`
+        // whenever a file is open, so this is the one fact that chip depends
+        // on: a real open must actually set it, to the workspace-relative
+        // spelling (not the absolute path a long project root would make
+        // unreadable in a narrow chip).
+        let root = scratch("open-file-composer-chip");
+        std::fs::write(root.join("todo.py"), "print('hi')\n").expect("file");
+        let mut state = HarnessState::new(root.clone(), None);
+        assert!(state.editor.buffer.is_none(), "nothing is open yet");
+        state.open_file(&root.join("todo.py"));
+        assert_eq!(state.editor.buffer.as_ref().map(|buffer| buffer.relative.as_str()), Some("todo.py"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn opening_and_resaving_a_route_with_no_edits_keeps_its_context_window_and_max_tokens() {
         // Regression pin: a model saved with only `contextWindow` set (no
         // `name`) had its context window silently renamed into the `name`

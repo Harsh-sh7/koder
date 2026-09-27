@@ -134,3 +134,14 @@
         # advises low values for code, Qwen's coder models ~0.7 — so measure it
         # on the practice issues before pinning it.
         temperature: !!js "process.env.AI_TEMPERATURE ? Number(process.env.AI_TEMPERATURE) : undefined"
+        # The most run_wave parts allowed to run at once. A free-tier key's
+        # account-wide rate limit can be smaller than what even three or four
+        # parts ask for in one burst (measured: a real Groq free key capped at
+        # 1,000 output-tokens/minute, shared across every part in the wave) —
+        # in which case every part in the wave fails together no matter how
+        # they are staggered or retried, because the wave asked for more in
+        # one minute than the account could ever serve. 2 is conservative
+        # enough to hold on that tier; raise it (or set 0 for "the whole wave
+        # at once") on a route with real headroom.
+        maxConcurrentParts: 2
+        interBatchDelayMs: 20000

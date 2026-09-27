@@ -602,6 +602,56 @@ pub fn action(ui: &mut Ui, label: &str, enabled: bool, colour: Color32) -> Respo
     response
 }
 
+/// A filled pill, for the one or two primary actions in a dialog — `action`'s
+/// plain coloured text is right for a toolbar or a list row, but a dialog's
+/// own "do the thing" control (save, remove, confirm) reads as a button only
+/// when it looks like one. `colour` is `ACCENT` or `RED` for a primary or
+/// destructive action, filled solid with light text; `DIM` renders as a
+/// secondary button instead — a soft fill with dark text — so a row of one
+/// primary and one secondary action reads as exactly that, not as two equally
+/// loud buttons.
+///
+/// @param ui the interface to draw into
+/// @param label the action's text
+/// @param enabled whether the action can run now
+/// @param colour `ACCENT`, `RED`, or `DIM` for a secondary button
+/// @returns the response
+pub fn button(ui: &mut Ui, label: &str, enabled: bool, colour: Color32) -> Response {
+    let secondary = colour == DIM;
+    let text_colour = if !enabled {
+        FAINT
+    } else if secondary {
+        TEXT
+    } else {
+        PANEL
+    };
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_string(), text(-1.0), text_colour);
+    let padding = Vec2::new(12.0, 6.0);
+    let size = galley.size() + padding * 2.0;
+    let (rect, response) = ui.allocate_exact_size(
+        size,
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    let fill = if !enabled {
+        HOVER_SOFT
+    } else if secondary {
+        if response.hovered() { HOVER_SOFT.gamma_multiply(0.9) } else { HOVER_SOFT }
+    } else if response.hovered() {
+        colour.gamma_multiply(0.85)
+    } else {
+        colour
+    };
+    ui.painter().rect_filled(rect, CornerRadius::same(6), fill);
+    ui.painter().galley(rect.min + padding, galley, text_colour);
+    response
+}
+
 /// A thin vertical or horizontal rule.
 ///
 /// @param ui the interface to draw into

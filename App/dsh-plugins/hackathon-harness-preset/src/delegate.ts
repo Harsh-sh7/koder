@@ -129,6 +129,29 @@ export function ownsPath(owned: readonly string[], target: string, cwd: string):
 }
 
 /**
+ * Split a wave's parts into batches of at most `size`, in order.
+ *
+ * A wave's parts share no file, so they are free to start together — but
+ * "free to" is not "safe to" on a route whose account-wide rate limit is
+ * small: a shared free-tier key can have a per-minute cap far below what even
+ * three or four parts ask for in one burst, in which case every part in the
+ * wave fails together, retry or not, because the total the wave asked for in
+ * that one minute was never obtainable — no amount of per-part backoff fixes
+ * a batch that was too big to begin with. Batching bounds how much of a wave
+ * is ever asked for at once; `size <= 0` means no batching (the whole wave is
+ * one batch, today's behaviour).
+ * @param parts - the wave's parts, in plan order.
+ * @param size - the largest batch to run at once; `<= 0` means unlimited.
+ * @returns the parts, grouped into batches of at most `size`.
+ */
+export function batchParts<T>(parts: readonly T[], size: number): T[][] {
+  if (size <= 0 || parts.length === 0) return parts.length === 0 ? [] : [[...parts]]
+  const batches: T[][] = []
+  for (let start = 0; start < parts.length; start += size) batches.push([...parts.slice(start, start + size)])
+  return batches
+}
+
+/**
  * The run as the parent model reads it: one line per part, grouped by wave,
  * and the one instruction the parent still owes — its own verification.
  * @param outcomes - every part's outcome, in wave order.

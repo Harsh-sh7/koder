@@ -455,14 +455,47 @@ fn composer_view(state: &mut HarnessState, ui: &mut Ui, rect: Rect) {
     let text_rect = Rect::from_min_max(inner.min, egui::pos2(inner.right(), rule_y - 8.0));
     let control = Rect::from_min_max(egui::pos2(inner.left(), rule_y + 8.0), inner.max);
 
-    // The attached-command chip rides above the prompt, since it is about what
-    // will be sent rather than about what is being typed.
+    // Context chips ride above the prompt, since they are about what the
+    // agent will read alongside it rather than about what is being typed.
+    // The editor's open file is first: it is ambient (already true before you
+    // type anything), where the attached command is something you just did.
+    let editing = state
+        .editor
+        .buffer
+        .as_ref()
+        .map(|buffer| buffer.relative.clone());
     let attached = state.agent.attached_block.clone();
     let mut drop_attachment = false;
+    let mut chips = 0u8;
+    if let Some(path) = &editing {
+        theme::inside(
+            ui,
+            Rect::from_min_size(
+                text_rect.min + Vec2::new(0.0, f32::from(chips) * 20.0),
+                Vec2::new(text_rect.width(), 20.0),
+            ),
+            |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("editing").size(11.5).color(theme::FAINT));
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(shorten(path, 58))
+                            .size(11.5)
+                            .monospace()
+                            .color(theme::DIM),
+                    );
+                });
+            },
+        );
+        chips += 1;
+    }
     if let Some(block) = &attached {
         theme::inside(
             ui,
-            Rect::from_min_size(text_rect.min, Vec2::new(text_rect.width(), 20.0)),
+            Rect::from_min_size(
+                text_rect.min + Vec2::new(0.0, f32::from(chips) * 20.0),
+                Vec2::new(text_rect.width(), 20.0),
+            ),
             |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("attached").size(11.5).color(theme::FAINT));
@@ -482,6 +515,7 @@ fn composer_view(state: &mut HarnessState, ui: &mut Ui, rect: Rect) {
                 });
             },
         );
+        chips += 1;
     }
     if drop_attachment {
         state.agent.attached_block = None;
@@ -496,12 +530,9 @@ fn composer_view(state: &mut HarnessState, ui: &mut Ui, rect: Rect) {
     let mut toggle_auto = false;
     let mut attach_last = false;
     let mut open_add = false;
+    let mut open_folder_picker = false;
 
-    let text_top = if attached.is_some() {
-        text_rect.top() + 24.0
-    } else {
-        text_rect.top()
-    };
+    let text_top = text_rect.top() + f32::from(chips) * 24.0;
     theme::inside(
         ui,
         Rect::from_min_max(egui::pos2(text_rect.left(), text_top), text_rect.max),
@@ -557,7 +588,8 @@ fn composer_view(state: &mut HarnessState, ui: &mut Ui, rect: Rect) {
             const SEND_FILL: egui::Color32 = egui::Color32::from_rgb(0x2F, 0x7D, 0x55);
             const SEND_HOVER: egui::Color32 = egui::Color32::from_rgb(0x25, 0x66, 0x45);
             const CHEVRON: f32 = 12.0;
-            const LEFT_MARKS: f32 = 26.0 * 3.0 + GAP * 2.0; // plus, clip, play
+            const FOLDER_NAME: f32 = 90.0;
+            const LEFT_MARKS: f32 = 26.0 * 4.0 + GAP * 3.0 + FOLDER_NAME; // plus, clip, folder (+ its name), play
             const RIGHT_MARKS: f32 = SEND + GAP + MIC + GAP + CHIP;
             const NAME_TAIL: f32 = CHEVRON + GAP + GAP; // and a gap on either side of the name
             let row = ui.available_width();
@@ -583,6 +615,32 @@ fn composer_view(state: &mut HarnessState, ui: &mut Ui, rect: Rect) {
                     .clicked()
                 {
                     attach_last = true;
+                }
+                let folder_name = state
+                    .root
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| state.root.display().to_string());
+                if icons::button(ui, Icon::Folder, theme::DIM, 26.0, theme::HOVER_SOFT)
+                    .on_hover_text(format!("{} — open a different folder", state.root.display()))
+                    .clicked()
+                {
+                    open_folder_picker = true;
+                }
+                if ui
+                    .add(
+                        egui::Label::new(
+                            RichText::new(shorten(&folder_name, 14))
+                                .size(12.5)
+                                .color(theme::DIM),
+                        )
+                        .sense(Sense::click())
+                        .truncate(),
+                    )
+                    .on_hover_text(format!("{} — open a different folder", state.root.display()))
+                    .clicked()
+                {
+                    open_folder_picker = true;
                 }
                 let auto = state.agent.auto_approve;
                 let colour = if auto { theme::ACCENT } else { theme::DIM };
@@ -770,6 +828,19 @@ fn composer_view(state: &mut HarnessState, ui: &mut Ui, rect: Rect) {
     }
     if open_models {
         state.open_model_dialog();
+    }
+    if open_folder_picker {
+        // The platform's own finder, not the in-app browser: this is the
+        // quick path from the composer, so it should feel like every other
+        // "choose a folder" prompt on the machine rather than a second
+        // browser to learn. It blocks until the user answers, which is the
+        // native panel's own modal behaviour, the same as any other app's.
+        if let Some(root) = rfd::FileDialog::new()
+            .set_directory(&state.root)
+            .pick_folder()
+        {
+            state.switch_workspace(root);
+        }
     }
     if stop {
         state.stop_turn();

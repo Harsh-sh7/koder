@@ -59,7 +59,7 @@ import {
 import type { ReviewRole } from './policy.ts'
 import { planWaves } from './waves.ts'
 import type { Subtask, WavePlan } from './waves.ts'
-import { ownsPath, PART_RESULT_SCHEMA, partPrompt, renderRun } from './delegate.ts'
+import { batchParts, ownsPath, PART_RESULT_SCHEMA, partPrompt, renderRun } from './delegate.ts'
 import type { PartOutcome, WavePart } from './delegate.ts'
 import { buildReport, renderReport } from './review.ts'
 import type { BudgetSnapshot, TurnReport, WaveOutcomeLog } from './review.ts'
@@ -69,7 +69,7 @@ export type { BudgetDecision, BudgetLimits, BudgetUsage, TokenTotals } from './b
 export { COMMITTEE_DESCRIPTION, CONTRACT_SECTION, contractText, REVIEW_ROLES, WAVE_PLAN_DESCRIPTION } from './policy.ts'
 export type { ReviewRole } from './policy.ts'
 export { normalizePath, planWaves, WavePlanError } from './waves.ts'
-export { ownsPath, partPrompt, renderRun } from './delegate.ts'
+export { batchParts, ownsPath, partPrompt, renderRun } from './delegate.ts'
 export type { PartOutcome, WavePart } from './delegate.ts'
 export type { FileConflict, Subtask, Wave, WavePlan } from './waves.ts'
 export { buildReport, renderReport } from './review.ts'
@@ -109,6 +109,8 @@ export const PART_RETRIES = 1
 export const PART_RETRY_DELAY_MS = 2_000
 /** How far apart a wave's parts are staggered on their first attempt. */
 export const PART_START_STAGGER_MS = 400
+/** Default milliseconds between batches, when a wave is split by `maxConcurrentParts`. */
+export const DEFAULT_INTER_BATCH_DELAY_MS = 20_000
 /** Resolves after `ms` milliseconds. */
 const sleep = (ms: number): Promise<void> => new Promise(resolve => { setTimeout(resolve, ms) })
 /**
@@ -205,6 +207,25 @@ export interface Config {
    * shared route's rate limit otherwise sees.
    */
   partStartStaggerMs?: number
+  /**
+   * The most parts of one `run_wave` wave allowed to run at once. `0`
+   * (default) means the whole wave runs at once, as before. A shared
+   * free-tier route's account-wide rate limit can be smaller than what even
+   * three or four parts ask for in a single burst — in which case every part
+   * fails together no matter how they are staggered or retried, because the
+   * wave asked for more in one minute than the account could ever serve. Set
+   * this below a wave's typical size on such a route; the remaining parts run
+   * in a later batch, after {@link interBatchDelayMs}, instead of all at once.
+   */
+  maxConcurrentParts?: number
+  /**
+   * Milliseconds to wait before starting the next batch, when
+   * {@link maxConcurrentParts} splits a wave into more than one. Long enough
+   * for a per-minute rate limit to partially recover; short enough not to
+   * waste the turn's budget waiting. Defaults to 20 seconds. Tests set this to
+   * 0.
+   */
+  interBatchDelayMs?: number
 }
 
 /** Runtime schema for {@link Config}. */
@@ -226,6 +247,8 @@ export const Config = z.object({
   ]),
   temperature: z.union([z.number().min(0).max(2), z.const(undefined)]),
   partStartStaggerMs: z.number().step(1).min(0).default(PART_START_STAGGER_MS),
+  maxConcurrentParts: z.number().step(1).min(0).default(0),
+  interBatchDelayMs: z.number().step(1).min(0).default(DEFAULT_INTER_BATCH_DELAY_MS),
 })
 
 /** One session's live budget state: what the ceiling currently is and what it has already done. */
@@ -754,67 +777,71 @@ export function apply(ctx: Context, config: Config): void {
         }
         wavesRun += 1
         const members = wave.subtasks.flatMap(id => byId.get(id) ?? [])
-        const settled = await Promise.all(members.map(async (part, index): Promise<PartOutcome> => {
-          const siblings = members.filter(other => other.id !== part.id).map(other => other.id)
-          // Every part in a wave shares one route's quota. Starting all of them
-          // in the exact same instant is the shape most likely to trip a
-          // provider's per-second or concurrent-request throttle — a stagger
-          // keeps this "parallel" (every part still runs at once, seconds
-          // apart, not one after another's full turn) while landing far softer
-          // on that limit. Retries below already carry their own delay, so the
-          // stagger applies to the first attempt only.
-          if (index > 0) await sleep(index * partStagger)
-          if (exec.signal.aborted) {
-            return { id: part.id, wave: wave.index, status: 'failed', summary: 'Cancelled before this part started.' }
-          }
-          let lastResult: SubagentResult | undefined
-          let lastThrown: string | undefined
-          for (let attempt = 1; attempt <= 1 + PART_RETRIES; attempt += 1) {
-            let run: SubagentRun | undefined
-            try {
-              run = await subagents.start(provider, {
-                label: `${RUN_WAVE}:${part.id}`,
-                prompt: [{ type: 'text', text: partPrompt(part, spec, siblings) }],
-                parent: agent,
-                signal: exec.signal,
-                outputSchema: PART_RESULT_SCHEMA as unknown as ObjectJsonSchema,
-                maxDepth: 1,
-                toolFilter: { deny: PART_DENIED_TOOLS.filter(name => ctx.tools.get(name, agent) !== undefined) },
-              })
-              owners.set(String(run.id), part.files)
-              const result = await run.result
-              if (result.stopReason === 'completed') {
-                const structured = result.structured as { status?: unknown; summary?: unknown } | undefined
-                const summary = typeof structured?.summary === 'string' && structured.summary.trim().length > 0
-                  ? structured.summary.trim()
-                  : partFailure(result, undefined)
-                return {
-                  id: part.id,
-                  wave: wave.index,
-                  status: structured?.status === 'done' ? 'done' : 'failed',
-                  summary,
+        const batches = batchParts(members, maxConcurrentParts)
+        for (const [batchIndex, batch] of batches.entries()) {
+          if (batchIndex > 0 && !exec.signal.aborted) await sleep(interBatchDelay)
+          const settled = await Promise.all(batch.map(async (part, index): Promise<PartOutcome> => {
+            const siblings = members.filter(other => other.id !== part.id).map(other => other.id)
+            // Every part in a wave shares one route's quota. Starting all of them
+            // in the exact same instant is the shape most likely to trip a
+            // provider's per-second or concurrent-request throttle — a stagger
+            // keeps this "parallel" (every part still runs at once, seconds
+            // apart, not one after another's full turn) while landing far softer
+            // on that limit. Retries below already carry their own delay, so the
+            // stagger applies to the first attempt only.
+            if (index > 0) await sleep(index * partStagger)
+            if (exec.signal.aborted) {
+              return { id: part.id, wave: wave.index, status: 'failed', summary: 'Cancelled before this part started.' }
+            }
+            let lastResult: SubagentResult | undefined
+            let lastThrown: string | undefined
+            for (let attempt = 1; attempt <= 1 + PART_RETRIES; attempt += 1) {
+              let run: SubagentRun | undefined
+              try {
+                run = await subagents.start(provider, {
+                  label: `${RUN_WAVE}:${part.id}`,
+                  prompt: [{ type: 'text', text: partPrompt(part, spec, siblings) }],
+                  parent: agent,
+                  signal: exec.signal,
+                  outputSchema: PART_RESULT_SCHEMA as unknown as ObjectJsonSchema,
+                  maxDepth: 1,
+                  toolFilter: { deny: PART_DENIED_TOOLS.filter(name => ctx.tools.get(name, agent) !== undefined) },
+                })
+                owners.set(String(run.id), part.files)
+                const result = await run.result
+                if (result.stopReason === 'completed') {
+                  const structured = result.structured as { status?: unknown; summary?: unknown } | undefined
+                  const summary = typeof structured?.summary === 'string' && structured.summary.trim().length > 0
+                    ? structured.summary.trim()
+                    : partFailure(result, undefined)
+                  return {
+                    id: part.id,
+                    wave: wave.index,
+                    status: structured?.status === 'done' ? 'done' : 'failed',
+                    summary,
+                  }
+                }
+                // Not `completed`: an infrastructure- or provider-level failure
+                // (a thrown transport error settles the same way, in the model),
+                // which is exactly the shape a transient rate limit or throttle
+                // takes — worth one retry before this part is reported failed.
+                lastResult = result
+              } catch (error: unknown) {
+                lastThrown = describeError(error)
+              } finally {
+                if (run !== undefined) {
+                  await run.dispose().catch((error: unknown) => {
+                    ctx.logger.warn(`harness-preset: ${RUN_WAVE}: releasing part ${part.id} failed: ${describeError(error)}`)
+                  })
+                  owners.delete(String(run.id))
                 }
               }
-              // Not `completed`: an infrastructure- or provider-level failure
-              // (a thrown transport error settles the same way, in the model),
-              // which is exactly the shape a transient rate limit or throttle
-              // takes — worth one retry before this part is reported failed.
-              lastResult = result
-            } catch (error: unknown) {
-              lastThrown = describeError(error)
-            } finally {
-              if (run !== undefined) {
-                await run.dispose().catch((error: unknown) => {
-                  ctx.logger.warn(`harness-preset: ${RUN_WAVE}: releasing part ${part.id} failed: ${describeError(error)}`)
-                })
-                owners.delete(String(run.id))
-              }
+              if (attempt <= PART_RETRIES && !exec.signal.aborted) await sleep(PART_RETRY_DELAY_MS)
             }
-            if (attempt <= PART_RETRIES && !exec.signal.aborted) await sleep(PART_RETRY_DELAY_MS)
-          }
-          return { id: part.id, wave: wave.index, status: 'failed', summary: partFailure(lastResult, lastThrown) }
-        }))
-        outcomes.push(...settled)
+            return { id: part.id, wave: wave.index, status: 'failed', summary: partFailure(lastResult, lastThrown) }
+          }))
+          outcomes.push(...settled)
+        }
       }
       const log = waveLog.get(agent.session) ?? []
       log.push(...outcomes.map(outcome => ({ id: outcome.id, wave: outcome.wave, status: outcome.status, summary: outcome.summary })))
@@ -904,6 +931,8 @@ export function apply(ctx: Context, config: Config): void {
   // per call: the header is what the prompt cache keys on, so a constant value
   // costs nothing, while a value that moved between steps would miss the cache.
   const partStagger = config.partStartStaggerMs ?? PART_START_STAGGER_MS
+  const maxConcurrentParts = config.maxConcurrentParts ?? 0
+  const interBatchDelay = config.interBatchDelayMs ?? DEFAULT_INTER_BATCH_DELAY_MS
   const temperature = config.temperature
   if (temperature !== undefined) {
     ctx.on('agent/request', async (_payload, next) => {

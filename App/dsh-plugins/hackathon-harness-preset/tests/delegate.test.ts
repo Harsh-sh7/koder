@@ -8,7 +8,7 @@
 import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
 
-import { ownsPath, partPrompt, renderRun } from '../src/delegate.ts'
+import { batchParts, ownsPath, partPrompt, renderRun } from '../src/delegate.ts'
 
 const cwd = '/work/repo'
 
@@ -55,4 +55,24 @@ test('the parent reads one line per part and the verification it still owes', ()
   assert.match(text, /\[wave 1\] core: done — todo\.py added; pytest passed\./u)
   assert.match(text, /\[wave 1\] docs: failed — README blocked/u)
   assert.match(text, /Fix the failed parts yourself/u)
+})
+
+test('size <= 0 keeps a wave as one batch — the default, unchanged behaviour', () => {
+  assert.deepEqual(batchParts(['a', 'b', 'c', 'd'], 0), [['a', 'b', 'c', 'd']])
+  assert.deepEqual(batchParts(['a', 'b', 'c', 'd'], -1), [['a', 'b', 'c', 'd']])
+})
+
+test('a wave larger than the batch size splits into ordered batches of at most that size', () => {
+  assert.deepEqual(batchParts(['a', 'b', 'c', 'd'], 2), [['a', 'b'], ['c', 'd']])
+  assert.deepEqual(batchParts(['a', 'b', 'c', 'd', 'e'], 2), [['a', 'b'], ['c', 'd'], ['e']])
+})
+
+test('a batch size at or above the wave size is still exactly one batch', () => {
+  assert.deepEqual(batchParts(['a', 'b'], 2), [['a', 'b']])
+  assert.deepEqual(batchParts(['a', 'b'], 5), [['a', 'b']])
+})
+
+test('an empty wave has no batches at all, not one empty batch', () => {
+  assert.deepEqual(batchParts([], 2), [])
+  assert.deepEqual(batchParts([], 0), [])
 })

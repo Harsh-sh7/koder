@@ -191,13 +191,13 @@ fn models(state: &mut HarnessState, ctx: &egui::Context, draft: &mut ModelDraft)
 
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if theme::action(ui, "save route", !draft.route.trim().is_empty(), theme::ACCENT).clicked() {
+                if theme::button(ui, "save route", !draft.route.trim().is_empty(), theme::ACCENT).clicked() {
                     save = true;
                 }
-                if draft.existing && theme::action(ui, "remove", true, theme::RED).clicked() {
+                if draft.existing && theme::button(ui, "remove", true, theme::RED).clicked() {
                     remove = true;
                 }
-                if theme::action(ui, "new", true, theme::DIM).clicked() {
+                if theme::button(ui, "new", true, theme::DIM).clicked() {
                     *draft = ModelDraft::empty();
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
