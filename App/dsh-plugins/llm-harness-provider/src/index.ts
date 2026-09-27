@@ -51,7 +51,7 @@ import { resolveProfiles } from '@deepseek-ai/dsh-llm-pi-ai/src/config.ts'
 import { Config, plainOptions, resolveOptions, routeProfiles } from './config.ts'
 import { documentSignature, readModelsDocument } from './document.ts'
 
-export { Config, plainOptions, resolveOptions, fallbackProfile, routeProfiles, unconfiguredProfile, resolveDefaultMaxTokens, DEFAULT_API_KEY_ENV, DEFAULT_MAX_TOKENS, DEFAULT_MODELS_FILE, DEFAULT_ROUTE, UNCONFIGURED_ROUTE, UNCONFIGURED_DISPLAY_NAME, UNCONFIGURED_BASE_URL } from './config.ts'
+export { Config, plainOptions, resolveOptions, fallbackProfile, routeProfiles, unconfiguredProfile, resolveDefaultMaxTokens, DEFAULT_API_KEY_ENV, DEFAULT_MAX_TOKENS, DEFAULT_CONTEXT_WINDOW, MIN_CONTEXT_WINDOW, DEFAULT_MODELS_FILE, DEFAULT_ROUTE, UNCONFIGURED_ROUTE, UNCONFIGURED_DISPLAY_NAME, UNCONFIGURED_BASE_URL } from './config.ts'
 export type { DefaultRouteInput, Options, ResolvedOptions } from './config.ts'
 export { ModelsDocumentError, parseModelsDocument, readModelsDocument, documentSignature } from './document.ts'
 export type { ModelsDocument } from './document.ts'

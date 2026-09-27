@@ -93,7 +93,7 @@ fn models(state: &mut HarnessState, ctx: &egui::Context, draft: &mut ModelDraft)
         .collect();
     let active = state.models.active.clone();
 
-    egui::Window::new("model routes")
+    egui::Window::new("Models & keys")
         .open(&mut open)
         .collapsible(false)
         .resizable(true)
@@ -239,7 +239,7 @@ fn workflow(state: &mut HarnessState, ctx: &egui::Context, draft: &mut WorkflowD
     let mut delete = false;
     let placeholders = draft.workflow.placeholders();
 
-    egui::Window::new(if draft.is_new { "new workflow" } else { "workflow" })
+    egui::Window::new(if draft.is_new { "New workflow" } else { "Workflow" })
         .open(&mut open)
         .collapsible(false)
         .resizable(true)
@@ -390,7 +390,7 @@ fn note(state: &mut HarnessState, ctx: &egui::Context, draft: &mut NoteDraft) ->
     let mut open = true;
     let mut save = false;
 
-    egui::Window::new("note")
+    egui::Window::new("Note")
         .open(&mut open)
         .collapsible(false)
         .resizable(true)
@@ -476,7 +476,7 @@ fn folder(state: &mut HarnessState, ctx: &egui::Context, draft: &mut FolderDraft
     let browsed = draft.dir.clone();
     let same = browsed == state.root;
 
-    egui::Window::new("open folder")
+    egui::Window::new("Open folder")
         .open(&mut open)
         .collapsible(false)
         .resizable(true)
@@ -595,7 +595,7 @@ fn folder(state: &mut HarnessState, ctx: &egui::Context, draft: &mut FolderDraft
 /// @returns true when the window should stay open
 fn about(ctx: &egui::Context) -> bool {
     let mut open = true;
-    egui::Window::new("about ai harness")
+    egui::Window::new("About AI Harness")
         .open(&mut open)
         .collapsible(false)
         .resizable(false)

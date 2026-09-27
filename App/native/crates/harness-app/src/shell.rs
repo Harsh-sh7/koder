@@ -191,29 +191,29 @@ pub fn sidebar(state: &mut HarnessState, ui: &mut Ui, rail: bool) {
             (
                 SidebarSpot::Extensions,
                 Icon::Grid,
-                "Extensions",
-                "model routes, providers and keys",
+                "Models & keys",
+                "model routes, providers and API keys (⌘,)",
                 None,
             ),
             (
                 SidebarSpot::Automations,
-                Icon::Clock,
-                "Automations",
-                "what the engine ran and spent: the meter",
+                Icon::Gauge,
+                "Usage",
+                "tokens, cost and everything the engine ran",
                 Some(Pane::Observability),
             ),
             (
                 SidebarSpot::Sites,
-                Icon::Window,
-                "Sites",
-                "files in this workspace, in the editor",
+                Icon::Folder,
+                "Files",
+                "browse and edit this workspace's files",
                 Some(Pane::Editor),
             ),
             (
                 SidebarSpot::Knowledge,
                 Icon::Book,
-                "Knowledge Center",
-                "saved workflows and notes",
+                "Workflows",
+                "saved prompts, commands and notes",
                 Some(Pane::Workflows),
             ),
         ] {
@@ -932,19 +932,15 @@ fn panel(state: &mut HarnessState, ui: &mut Ui, fab_inside: bool) {
     egui::Frame::new()
         .inner_margin(egui::Margin { left: 14, right: 12, top: 0, bottom: 0 })
         .show(ui, |ui| {
-            let colour = match state.agent.conversation.state {
-                RunState::Idle => theme::FAINT,
-                RunState::Running => theme::ACCENT,
-                RunState::AwaitingApproval { .. } => theme::AMBER,
-                RunState::Failed { .. } => theme::RED,
-            };
+            let phase = SessionPhase::of(state);
+            let colour = phase.colour();
             ui.horizontal(|ui| {
-                match state.agent.conversation.state {
-                    RunState::Running => {
-                        theme::spinner(ui, 15.0, theme::ACCENT);
+                match phase {
+                    SessionPhase::Working => {
+                        theme::spinner(ui, 15.0, colour);
                     }
                     _ => {
-                        icons::icon(ui, Icon::Sparkle, theme::GREEN, 15.0);
+                        icons::icon(ui, phase.icon(), colour, 15.0);
                     }
                 }
                 ui.add_space(7.0);
@@ -956,7 +952,7 @@ fn panel(state: &mut HarnessState, ui: &mut Ui, fab_inside: bool) {
                         state.save_config();
                     }
                     ui.add_space(4.0);
-                    theme::badge(ui, state.agent.conversation.state.label(), colour);
+                    theme::badge(ui, phase.label(), colour);
                 });
             });
         });
@@ -974,6 +970,7 @@ fn panel(state: &mut HarnessState, ui: &mut Ui, fab_inside: bool) {
     let model = model_label(state);
     let notice = state.notice();
     let last_activity = state.last_activity;
+    let phase = SessionPhase::of(state);
     let delegations = state.delegations();
     let artifacts = state.artifacts();
     let processes = state.processes();
@@ -1001,15 +998,27 @@ fn panel(state: &mut HarnessState, ui: &mut Ui, fab_inside: bool) {
                     }
 
                     // The notice: when the session last moved, and what it said.
-                    let (stamp, body) = notice.unwrap_or_else(|| {
+                    // Headed by the outcome in words ("Finished at 21:07"), not a
+                    // bare timestamp, and kept to a few lines: the transcript
+                    // holds the whole answer; this is the glance.
+                    let (_, body) = notice.unwrap_or_else(|| {
                         (
-                            format!("Updated at {}", last_activity.format("%H:%M")),
-                            "Nothing has been asked yet. What the agent does, who it hands work to, and what it builds shows up here."
+                            String::new(),
+                            "Ask for a change or describe what to build. What the agent does, who it hands work to, and what it builds shows up here."
                                 .to_string(),
                         )
                     });
+                    let body = crate::app::shorten_words(&body, 190);
+                    let stamp = match phase {
+                        SessionPhase::Ready => "Ready".to_string(),
+                        SessionPhase::Working => format!("Working · since {}", last_activity.format("%H:%M")),
+                        SessionPhase::NeedsYou => "Waiting for your answer".to_string(),
+                        SessionPhase::Done => format!("Finished at {}", last_activity.format("%H:%M")),
+                        SessionPhase::Stopped => format!("Stopped at {}", last_activity.format("%H:%M")),
+                        SessionPhase::Failed => format!("Failed at {}", last_activity.format("%H:%M")),
+                    };
                     theme::card(ui, theme::ELEVATED, None, |ui| {
-                        ui.label(RichText::new(stamp).size(12.0).color(theme::FAINT));
+                        ui.label(RichText::new(stamp).size(12.0).color(phase.colour()));
                         ui.add_space(4.0);
                         ui.add(egui::Label::new(RichText::new(body).size(13.0).color(theme::TEXT)).wrap());
                     });
@@ -1017,6 +1026,7 @@ fn panel(state: &mut HarnessState, ui: &mut Ui, fab_inside: bool) {
 
                     // Subagents: every agent this task handed work to, with its
                     // state; a running one can be stopped with its turn.
+                    let turn_live = state.agent.conversation.state.busy();
                     if section_header(ui, "Subagents", delegations.len(), None, "subagents") {
                         if delegations.is_empty() {
                             empty_line(ui, "Parts of a job the harness runs in parallel appear here.");
@@ -1035,7 +1045,12 @@ fn panel(state: &mut HarnessState, ui: &mut Ui, fab_inside: bool) {
                                     );
                                 });
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    if !delegation.done {
+                                    if !delegation.done && !turn_live {
+                                        // Its turn is over and it never reported back:
+                                        // nothing is running it any more.
+                                        icons::icon(ui, Icon::Stop, theme::FAINT, 11.0)
+                                            .on_hover_text("stopped — the turn ended before this part reported back");
+                                    } else if !delegation.done {
                                         let stop_mark = icons::button(ui, Icon::Stop, theme::FAINT, 20.0, theme::HOVER_SOFT);
                                         if stop_mark
                                             .on_hover_text("stop — ends the turn this agent runs in")
@@ -1489,7 +1504,7 @@ fn fab(state: &mut HarnessState, ui: &mut Ui, rect: Rect) {
     }
     painter.circle_filled(rect.center(), size / 2.0, fill);
     icons::paint(ui, Icon::Question, rect.shrink(size * 0.32), theme::PANEL);
-    if response.on_hover_text("keys").clicked() {
+    if response.on_hover_text("keyboard shortcuts").clicked() {
         state.help_open = true;
     }
 }
@@ -1524,4 +1539,82 @@ fn toast(state: &HarnessState, ui: &mut Ui, card: Rect) {
         theme::TEXT.gamma_multiply(alpha * 0.92),
     );
     painter.galley(rect.min + Vec2::new(12.0, 7.0), galley, theme::PANEL);
+}
+
+/// Where the session stands, in the words its panel uses.
+///
+/// Derived for display from the run state and the transcript — it changes
+/// nothing about how a turn runs. "Idle" alone threw away the one thing a
+/// person glancing at the panel wants to know: whether the last thing asked
+/// actually finished.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SessionPhase {
+    /// Nothing asked yet in this task.
+    Ready,
+    /// A turn is running.
+    Working,
+    /// The engine is waiting on a permission answer.
+    NeedsYou,
+    /// The last turn ended with an answer.
+    Done,
+    /// The last turn ended without one (stopped by the user).
+    Stopped,
+    /// The last turn failed.
+    Failed,
+}
+
+impl SessionPhase {
+    /// @param state the application state
+    /// @returns the phase
+    fn of(state: &HarnessState) -> Self {
+        use harness_core::agent::Item;
+        let conversation = &state.agent.conversation;
+        match conversation.state {
+            RunState::Running => return Self::Working,
+            RunState::AwaitingApproval { .. } => return Self::NeedsYou,
+            RunState::Failed { .. } => return Self::Failed,
+            RunState::Idle => {}
+        }
+        let last_user = conversation.items.iter().rposition(|item| matches!(item, Item::User { .. }));
+        let Some(last_user) = last_user else { return Self::Ready };
+        // Done means the turn ended the way a finished turn does: with an
+        // answer as its last word. A tool call as the last thing is a turn
+        // that was cut off mid-step (stopped, or the app closed under it).
+        let ended_with_answer = conversation.items[last_user..]
+            .iter()
+            .rev()
+            .find(|item| matches!(item, Item::Assistant { .. } | Item::Tool(_)))
+            .is_some_and(|item| matches!(item, Item::Assistant { text, .. } if !text.trim().is_empty()));
+        if ended_with_answer { Self::Done } else { Self::Stopped }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Working => "working",
+            Self::NeedsYou => "needs you",
+            Self::Done => "done",
+            Self::Stopped => "stopped",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn colour(self) -> egui::Color32 {
+        match self {
+            Self::Ready | Self::Stopped => theme::FAINT,
+            Self::Working => theme::ACCENT,
+            Self::NeedsYou => theme::AMBER,
+            Self::Done => theme::GREEN,
+            Self::Failed => theme::RED,
+        }
+    }
+
+    fn icon(self) -> Icon {
+        match self {
+            Self::Done => Icon::Check,
+            Self::Failed => Icon::Cross,
+            Self::Stopped => Icon::Stop,
+            _ => Icon::Sparkle,
+        }
+    }
 }

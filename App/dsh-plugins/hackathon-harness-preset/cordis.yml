@@ -20,7 +20,7 @@
 #                     e.g. qwen/qwen3.7-plus, deepseek/deepseek-v4-pro)
 #   AI_BASE_URL       OpenAI-compatible API root (default https://openrouter.ai/api/v1)
 #   AI_CONTEXT_WINDOW working context the harness compacts within (default 131072)
-#   AI_MAX_TOKENS     output tokens one response may use     (default 8192)
+#   AI_MAX_TOKENS     output tokens one response may use     (default 2000)
 #                     — raise this for a route that allows more; some providers
 #                     (Groq is one) reject a request above their own per-model
 #                     ceiling even though it is well under the context window,
@@ -94,7 +94,7 @@
         # the window compaction works within, and an agent loop re-sends its
         # whole context on every step, so an unbounded window is paid for again
         # and again.
-        defaultRoute: !!js "({ displayName: process.env.AI_MODEL || process.env.AI_HARNESS_FALLBACK_MODEL || 'deepseek/deepseek-v4-flash', baseURL: process.env.AI_BASE_URL || process.env.AI_HARNESS_FALLBACK_BASE_URL || 'https://openrouter.ai/api/v1', model: process.env.AI_MODEL || process.env.AI_HARNESS_FALLBACK_MODEL || 'deepseek/deepseek-v4-flash', contextWindow: Number(process.env.AI_CONTEXT_WINDOW || 131072), maxTokens: Number(process.env.AI_MAX_TOKENS || 8192) })"
+        defaultRoute: !!js "({ displayName: process.env.AI_MODEL || process.env.AI_HARNESS_FALLBACK_MODEL || 'deepseek/deepseek-v4-flash', baseURL: process.env.AI_BASE_URL || process.env.AI_HARNESS_FALLBACK_BASE_URL || 'https://openrouter.ai/api/v1', model: process.env.AI_MODEL || process.env.AI_HARNESS_FALLBACK_MODEL || 'deepseek/deepseek-v4-flash', contextWindow: Number(process.env.AI_CONTEXT_WINDOW || 131072), maxTokens: Number(process.env.AI_MAX_TOKENS || 2000) })"
 
     # The session's opening instruction stays frozen: restated whenever context
     # management drops it, amendable only with the user's approval, and readable

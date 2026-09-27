@@ -2081,6 +2081,13 @@ impl HarnessState {
                         harness_core::agent::Item::Notice { text, .. } => Some(text.clone()),
                         _ => None,
                     })
+            })
+            // Before the first answer, the panel says what it was asked —
+            // never "nothing has been asked yet" while the agent is working.
+            .or_else(|| {
+                self.agent.conversation.first_prompt().map(|asked| {
+                    format!("Working on: {}", plain_summary(asked, 280))
+                })
             });
         body.map(|body| (stamp, body))
     }
@@ -2842,6 +2849,29 @@ impl HarnessState {
         if text.is_empty() {
             return;
         }
+        if let Some(message) = missing_credential_message(
+            self.models.active.as_ref(),
+            &self.models.providers,
+            |name| std::env::var(name).ok(),
+        ) {
+            // The message is shown like any other send, so the transcript
+            // reads "you asked X — here is why it could not run", and "try
+            // again" resends it once a key is in place.
+            self.agent.conversation.begin_prompt(text);
+            self.agent.conversation.fail(message);
+            self.agent.last_prompt = Some(text.to_string());
+            self.agent.input.clear();
+            self.scroll_to_bottom = true;
+            return;
+        }
+        // The prompt the user just typed is the reason to be at the bottom —
+        // `stick_to_bottom` only keeps following the newest line while the
+        // reader was already there, so it does nothing when the reader had
+        // scrolled up even slightly, and the new message then lands off
+        // screen above the fold instead of in view. Sending a prompt is an
+        // unconditional reason to jump, the same as the "jump to latest"
+        // button.
+        self.scroll_to_bottom = true;
         self.ensure_engine();
         let route_ready = self.apply_requested_model();
         let Some(client) = self.agent.client.as_ref() else {
@@ -3576,10 +3606,6 @@ impl HarnessState {
                 // A finished turn is the natural checkpoint: the whole answer is in.
                 self.save_task();
             }
-            if let AgentEvent::Initialized { name, version } = event {
-                self.agent.conversation.engine_name = name;
-                self.agent.conversation.engine_version = version;
-            }
         }
     }
 
@@ -3760,6 +3786,49 @@ enum RouteMismatch {
     Report,
 }
 
+/// Whether the active (or default) route can actually be asked anything, and
+/// what to say when it cannot.
+///
+/// Checked before any engine or token is spent: a workspace nobody has
+/// configured a real key for otherwise fails only after `ensure_engine`
+/// starts a session, the model answers 401/429/whatever the free route's
+/// shared pool says today, and — worse — if the prompt decomposes into
+/// `run_wave` parts, several subagents each retry once against the same dead
+/// route before the wave as a whole reports failed. All of that is avoidable:
+/// the one fact that predicts every one of those failures, "is there a real
+/// value behind the credential this route reads," is knowable for free before
+/// any of it starts.
+///
+/// @param active the workspace's selected route, absent when none was ever chosen (the true first-run case)
+/// @param providers the route profiles the selected route is looked up in
+/// @param env reads one named variable's current value; a closure so tests need not touch real process env
+/// @returns the message to fail the turn with, or nothing when the route has a usable key
+fn missing_credential_message(
+    active: Option<&harness_core::config::ActiveRoute>,
+    providers: &std::collections::BTreeMap<String, harness_core::config::ProviderProfile>,
+    env: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    let key_var = active
+        .and_then(|active| providers.get(&active.provider))
+        .and_then(|profile| profile.api_key_env.as_deref())
+        .unwrap_or("AI_API_KEY");
+    let usable = env(key_var).is_some_and(|value| {
+        let value = value.trim();
+        !value.is_empty() && value != "mock-key"
+    });
+    if usable {
+        return None;
+    }
+    let route_label = match active {
+        Some(active) => format!("{}/{}", active.provider, active.model),
+        None => "the free demo model".to_string(),
+    };
+    Some(format!(
+        "{route_label} has no {key_var} set, so this can't actually run — nothing was spent trying. \
+         Add a model and its key (\u{2318},), then press try again to resume this message."
+    ))
+}
+
 /// Decides what a mismatched route earns: one restart, then a plain report.
 ///
 /// Keyed on the route string itself (not a bare flag) so a *different* route
@@ -3925,6 +3994,47 @@ mod tests {
             r#"{"providers":{"deepseek":{"baseURL":"https://api.deepseek.com/v1","apiKeyEnv":"AI_API_KEY","models":[{"id":"deepseek-chat"}]}},"active":{"provider":"deepseek","model":"deepseek-chat"}}"#,
         )
         .expect("models document");
+    }
+
+    #[test]
+    fn a_route_with_no_never_configured_active_route_reads_ai_api_key_and_names_itself_the_demo_model() {
+        // The true first-run case: nobody has ever opened the model dialog, so
+        // `active` is absent and the engine falls back to cordis.yml's own
+        // default route, which reads AI_API_KEY.
+        let providers = std::collections::BTreeMap::new();
+        assert_eq!(missing_credential_message(None, &providers, |_| None), Some(
+            "the free demo model has no AI_API_KEY set, so this can't actually run — nothing was spent trying. \
+             Add a model and its key (\u{2318},), then press try again to resume this message.".to_string()
+        ));
+        assert_eq!(missing_credential_message(None, &providers, |name| (name == "AI_API_KEY").then(|| "sk-real".to_string())), None);
+    }
+
+    #[test]
+    fn a_configured_route_is_checked_under_its_own_key_variable_not_ai_api_key() {
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert("Groq".to_string(), ProviderProfile {
+            display_name: Some("Groq".to_string()),
+            api: None,
+            base_url: None,
+            api_key_env: Some("GROQ_API_KEY".to_string()),
+            models: None,
+        });
+        let active = harness_core::config::ActiveRoute { provider: "Groq".to_string(), model: "qwen/qwen3.8-27b".to_string() };
+        // AI_API_KEY being set must not matter — this route reads its own variable.
+        let env = |name: &str| (name == "AI_API_KEY").then(|| "unrelated".to_string());
+        let message = missing_credential_message(Some(&active), &providers, env).expect("no GROQ_API_KEY is set");
+        assert!(message.contains("Groq/qwen/qwen3.8-27b"));
+        assert!(message.contains("GROQ_API_KEY"));
+        let env = |name: &str| (name == "GROQ_API_KEY").then(|| "gsk_real".to_string());
+        assert_eq!(missing_credential_message(Some(&active), &providers, env), None);
+    }
+
+    #[test]
+    fn an_empty_or_placeholder_key_is_the_same_as_no_key_at_all() {
+        let providers = std::collections::BTreeMap::new();
+        assert!(missing_credential_message(None, &providers, |_| Some(String::new())).is_some());
+        assert!(missing_credential_message(None, &providers, |_| Some("   ".to_string())).is_some());
+        assert!(missing_credential_message(None, &providers, |_| Some("mock-key".to_string())).is_some());
     }
 
     #[test]

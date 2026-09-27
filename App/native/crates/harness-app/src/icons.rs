@@ -79,6 +79,8 @@ pub enum Icon {
     Gauge,
     /// Three dots: more actions.
     More,
+    /// An empty circle: a step not started yet.
+    Circle,
     /// An arrow pointing left: back.
     ArrowLeft,
     /// An arrow pointing right: forward.
@@ -158,6 +160,7 @@ pub fn paint(ui: &Ui, icon: Icon, rect: Rect, colour: Color32) {
         Icon::Branch => pen.branch(),
         Icon::Gauge => pen.gauge(),
         Icon::More => pen.more(),
+        Icon::Circle => pen.arc(0.5, 0.5, 0.34, 0.0, std::f32::consts::TAU, 1.0),
         Icon::ArrowLeft => pen.arrow_left(),
         Icon::ArrowRight => pen.arrow_right(),
         Icon::ArrowDown => pen.arrow_down(),

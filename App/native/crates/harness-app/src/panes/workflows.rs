@@ -169,9 +169,6 @@ fn row(
         ui.horizontal(|ui| {
             ui.label(RichText::new(&workflow.name).size(12.0).color(theme::TEXT));
             theme::badge(ui, workflow.kind.label(), kind_colour);
-            if workflow.seeded {
-                theme::badge(ui, "seeded", theme::FAINT);
-            }
             if missing > 0 {
                 theme::badge(ui, &format!("{missing} to fill"), theme::AMBER);
             }

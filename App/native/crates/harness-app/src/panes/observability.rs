@@ -32,7 +32,7 @@ const KINDS: usize = 12;
 /// @param ui the interface to draw into
 pub fn show(state: &mut HarnessState, ui: &mut Ui) {
     ui.horizontal(|ui| {
-        theme::section(ui, "meter");
+        theme::section(ui, "usage");
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if theme::action(ui, "export transcript", true, theme::DIM).clicked() {
                 match state.export_transcript() {
@@ -426,12 +426,6 @@ fn engine(state: &HarnessState, ui: &mut Ui) {
                     ui,
                     "harness home",
                     &shorten(&paths.dsh_home.display().to_string(), 46),
-                    theme::FAINT,
-                );
-                theme::stat_row(
-                    ui,
-                    "engine repo",
-                    &shorten(&paths.dsh_repo.display().to_string(), 46),
                     theme::FAINT,
                 );
                 theme::stat_row(

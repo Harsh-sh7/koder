@@ -15,7 +15,7 @@
 //!   occupancy, not a per-turn token bill, so the transcript's own token counts
 //!   are heuristics and the UI says so.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -520,6 +520,48 @@ pub fn estimate_tokens(text: &str) -> u64 {
     chars.div_ceil(CHARS_PER_TOKEN)
 }
 
+/// Output still streaming for the current model step: drawn provisionally at
+/// the end of the transcript and dropped the moment the step's committed
+/// message (or tool call) arrives, so it is never saved and never duplicated.
+#[derive(Debug, Clone, Default)]
+pub struct LiveTurn {
+    /// The model attempt being streamed.
+    pub attempt: String,
+    /// Answer text so far.
+    pub text: String,
+    /// Reasoning so far.
+    pub thought: String,
+    /// Tool calls whose arguments are still being written.
+    pub tools: Vec<LiveTool>,
+}
+
+/// One tool call while the model is still writing its arguments.
+#[derive(Debug, Clone, Default)]
+pub struct LiveTool {
+    /// Call id.
+    pub id: String,
+    /// Tool name, once the stream has named it.
+    pub name: String,
+    /// Argument JSON received so far (usually incomplete).
+    pub args: String,
+}
+
+impl LiveTool {
+    /// The file this call is writing, read from its partial arguments.
+    ///
+    /// @returns the path, once enough of the arguments has arrived to name it
+    pub fn target(&self) -> Option<String> {
+        for key in ["\"file_path\"", "\"path\"", "\"command\""] {
+            let Some(start) = self.args.find(key) else { continue };
+            let rest = &self.args[start + key.len()..];
+            let rest = rest.trim_start().strip_prefix(':')?.trim_start().strip_prefix('"')?;
+            let end = rest.find('"')?;
+            return Some(rest[..end].to_string());
+        }
+        None
+    }
+}
+
 /// One conversation: transcript, run state, plan, and accounting.
 #[derive(Debug)]
 pub struct Conversation {
@@ -557,6 +599,11 @@ pub struct Conversation {
     cards: HashMap<String, usize>,
     /// When the current prompt was sent.
     prompt_started: Option<std::time::Instant>,
+    /// The step streaming right now, when the engine mirrors live output.
+    pub live: Option<LiveTurn>,
+    /// Attempts whose committed output already arrived: a late live delta for
+    /// one of these (stderr and the ACP channel are separate pipes) is stale.
+    settled_attempts: HashSet<String>,
 }
 
 impl Conversation {
@@ -583,6 +630,8 @@ impl Conversation {
             user_streams: HashMap::new(),
             cards: HashMap::new(),
             prompt_started: None,
+            live: None,
+            settled_attempts: HashSet::new(),
         }
     }
 
@@ -716,6 +765,7 @@ impl Conversation {
     ///
     /// @param message what went wrong
     pub fn fail(&mut self, message: impl Into<String>) {
+        self.settle_live();
         let message = message.into();
         self.items.push(Item::Notice {
             level: NoticeLevel::Error,
@@ -724,11 +774,69 @@ impl Conversation {
         self.state = RunState::Failed { message };
     }
 
+    /// Grows (or starts) the provisional stream for the step in flight.
+    ///
+    /// @param event a [`AgentEvent::Live`] delta
+    /// @returns whether anything visible changed
+    fn apply_live(&mut self, event: &AgentEvent) -> bool {
+        let AgentEvent::Live { attempt, kind, text, call_id, name, .. } = event else {
+            return false;
+        };
+        if self.settled_attempts.contains(attempt) {
+            return false;
+        }
+        if kind == "end" {
+            // Keep what streamed on screen until the committed message lands.
+            return false;
+        }
+        if self.live.as_ref().is_none_or(|live| &live.attempt != attempt) {
+            self.live = Some(LiveTurn { attempt: attempt.clone(), ..LiveTurn::default() });
+        }
+        let Some(live) = self.live.as_mut() else { return false };
+        match kind.as_str() {
+            "text" => live.text.push_str(text),
+            "thought" => live.thought.push_str(text),
+            "tool" => {
+                let index = match live.tools.iter().position(|tool| &tool.id == call_id) {
+                    Some(index) => index,
+                    None => {
+                        live.tools.push(LiveTool { id: call_id.clone(), ..LiveTool::default() });
+                        live.tools.len() - 1
+                    }
+                };
+                let tool = &mut live.tools[index];
+                if let Some(name) = name.as_ref().filter(|name| !name.is_empty()) {
+                    tool.name.clone_from(name);
+                }
+                tool.args.push_str(text);
+            }
+            _ => return kind == "start",
+        }
+        true
+    }
+
+    /// Drops the provisional stream: the committed output replaces it.
+    fn settle_live(&mut self) {
+        if let Some(live) = self.live.take() {
+            self.settled_attempts.insert(live.attempt);
+        }
+    }
+
     /// Reduces one engine event into the transcript.
     ///
     /// @param event the event, as delivered by the ACP client
     /// @returns whether the transcript, plan, or state changed visibly
     pub fn apply(&mut self, event: &AgentEvent) -> bool {
+        match event {
+            AgentEvent::Live { .. } => return self.apply_live(event),
+            // Committed output supersedes whatever was streaming provisionally.
+            AgentEvent::AgentMessage { .. }
+            | AgentEvent::AgentThought { .. }
+            | AgentEvent::ToolCall { .. }
+            | AgentEvent::TurnEnded { .. }
+            | AgentEvent::EngineExited { .. } => self.settle_live(),
+            _ => {}
+        }
         match event {
             AgentEvent::Initialized { name: _, version: _ } => {
                 // The wire's own `agentInfo` names the vendored engine directly
@@ -853,6 +961,8 @@ impl Conversation {
                 self.push_log(format!("unhandled notification: {method}"));
                 true
             }
+            // Handled before this match, by `apply_live`.
+            AgentEvent::Live { .. } => false,
             AgentEvent::EngineLog { line } => {
                 self.push_log(line.clone());
                 // Log lines stream constantly; they redraw the diagnostics pane
@@ -1176,6 +1286,62 @@ mod tests {
             }],
         });
         conversation
+    }
+
+    fn live(attempt: &str, kind: &str, text: &str) -> AgentEvent {
+        AgentEvent::Live {
+            session_id: "s-1".to_string(),
+            attempt: attempt.to_string(),
+            kind: kind.to_string(),
+            text: text.to_string(),
+            call_id: "call-1".to_string(),
+            name: (kind == "tool").then(|| "write".to_string()),
+        }
+    }
+
+    #[test]
+    fn a_streaming_step_grows_live_and_its_committed_message_replaces_it() {
+        let mut conversation = session();
+        conversation.begin_prompt("hi");
+        assert!(conversation.apply(&live("a1", "start", "")));
+        conversation.apply(&live("a1", "thought", "thinking "));
+        conversation.apply(&live("a1", "text", "Hello "));
+        conversation.apply(&live("a1", "text", "world"));
+        let current = conversation.live.clone().expect("live while streaming");
+        assert_eq!(current.text, "Hello world");
+        assert_eq!(current.thought, "thinking ");
+        let items = conversation.items.len();
+        // The committed message arrives: the provisional copy goes, and the
+        // transcript holds exactly one answer — never the stream plus the commit.
+        conversation.apply(&AgentEvent::AgentMessage {
+            session_id: "s-1".to_string(),
+            message_id: "m-1".to_string(),
+            text: "Hello world".to_string(),
+        });
+        assert!(conversation.live.is_none());
+        assert_eq!(conversation.items.len(), items + 1);
+        // A delta for that attempt arriving late (separate pipe) is stale.
+        assert!(!conversation.apply(&live("a1", "text", "late")));
+        assert!(conversation.live.is_none());
+    }
+
+    #[test]
+    fn a_tool_call_being_written_shows_its_target_file_and_growing_size() {
+        let mut conversation = session();
+        conversation.apply(&live("a2", "tool", "{\"file_path\": \"src/todo.py\", \"content\": \"imp"));
+        conversation.apply(&live("a2", "tool", "ort json"));
+        let tool = conversation.live.as_ref().expect("live").tools[0].clone();
+        assert_eq!(tool.name, "write");
+        assert_eq!(tool.target().as_deref(), Some("src/todo.py"));
+        assert!(tool.args.ends_with("import json"));
+    }
+
+    #[test]
+    fn a_failed_or_ended_turn_never_leaves_a_live_bubble_behind() {
+        let mut conversation = session();
+        conversation.apply(&live("a3", "text", "partial"));
+        conversation.fail("the route is rate-limited");
+        assert!(conversation.live.is_none());
     }
 
     #[test]

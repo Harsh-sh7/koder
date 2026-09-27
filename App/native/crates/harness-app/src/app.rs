@@ -537,6 +537,21 @@ pub fn shorten(text: &str, limit: usize) -> String {
     format!("{head}…{tail}")
 }
 
+/// Text cut at a word boundary near `limit` characters, with an ellipsis —
+/// for summaries, where a mid-word cut ("Parse the comm…") reads as broken.
+///
+/// @param text the text
+/// @param limit the most characters to keep
+/// @returns the text, whole or cut
+pub fn shorten_words(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let cut: String = text.chars().take(limit).collect();
+    let cut = cut.rsplit_once(' ').map_or(cut.as_str(), |(head, _)| head).trim_end_matches(|c: char| c == ',' || c == ';' || c == ':');
+    format!("{cut}…")
+}
+
 /// A token count in the shortest honest form.
 ///
 /// @param tokens the count

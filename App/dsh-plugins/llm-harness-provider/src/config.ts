@@ -29,11 +29,53 @@ export const DEFAULT_ROUTE = 'default'
  * dsh's own fallback, applied at exactly that point, is 32768 — larger than
  * some providers' real per-model ceiling even though it is well under the
  * model's context window (Groq is one: it rejects the request outright rather
- * than clamping it). This is deliberately conservative instead, and is what
- * makes a route someone adds through the model dialog — not only the
- * `cordis.yml` fallback — safe by default on such a provider.
+ * than clamping it). Free-tier ceilings run tighter than "larger than a
+ * per-model cap" too, though: measured against a real Groq free key, its
+ * account-wide limit was 1,000 *output* tokens a minute, shared across every
+ * request in flight — a number no single deployment-wide constant can dodge
+ * for every provider at once, but this is picked to fit comfortably under the
+ * tightest free tiers seen in practice while still leaving room for an actual
+ * file's worth of output, rather than only clearing the bar of "some cap".
+ * This is what makes a route someone adds through the model dialog — on
+ * OpenRouter, Groq, or anywhere else — safe by default without hand-tuning
+ * every route the moment it turns out to be a free one.
  */
-export const DEFAULT_MAX_TOKENS = 8_192
+export const DEFAULT_MAX_TOKENS = 2_000
+
+/**
+ * Working context one route may use, for any per-model entry that declares no
+ * `contextWindow` of its own.
+ *
+ * Deliberately not read from `AI_CONTEXT_WINDOW`: that variable's own default
+ * (131072, applied to the `cordis.yml` fallback route) is sized for a capable
+ * route and would hand the same large number to every route added through the
+ * model dialog if reused here — including a free-tier key whose real
+ * per-minute budget is a few thousand tokens *total*, input and output
+ * combined. An agent loop resends its whole working context on every step, so
+ * an unbounded window is exactly what turns "wrote a bit too much" into
+ * "blew the account's rate limit on request one." Compaction keeps the
+ * conversation inside this window, so it bounds what every step resends.
+ *
+ * It must still sit well above the harness's own fixed prefix: the system
+ * prompt plus every tool schema is ~5k tokens before the conversation says a
+ * word (measured from a recorded request), and the engine sizes each
+ * response's output budget as window minus input. A 5k window once shipped
+ * here, and every request went out with `max_tokens: 1` — the model thought
+ * one token ("The") and the turn stopped dead.
+ */
+export const DEFAULT_CONTEXT_WINDOW = 32_768
+
+/**
+ * The smallest context window a route is ever given, whatever it declares.
+ *
+ * Below this, the fixed prefix (system prompt + tool schemas, ~5k tokens)
+ * plus a conversation plus a response cannot fit, and the engine's output
+ * budget (window minus input) collapses to a handful of tokens — every turn
+ * then ends after the model's first word with no error, which is far worse
+ * than any rate limit. So this is a correctness floor, not a preference, and
+ * it applies to an explicitly configured value too.
+ */
+export const MIN_CONTEXT_WINDOW = 16_384
 
 /**
  * The configured output-token cap, from `AI_MAX_TOKENS` — read directly from
@@ -189,26 +231,29 @@ export function routeProfiles(
   fallback: { route: string; profile: PiAiProviderProfile } | undefined,
   document: Record<string, PiAiProviderProfile>,
   defaultMaxTokens: number = resolveDefaultMaxTokens(),
+  defaultContextWindow: number = DEFAULT_CONTEXT_WINDOW,
 ): Record<string, PiAiProviderProfile> {
   const declared = {
     ...fallback === undefined ? {} : { [fallback.route]: fallback.profile },
     ...document,
   }
   if (Object.keys(declared).length === 0) return { [UNCONFIGURED_ROUTE]: unconfiguredProfile() }
-  // A model that names no output cap of its own gets this harness's
-  // conservative one, so a route added through the model dialog — not only
-  // the cordis.yml fallback — is safe by default on a provider like Groq.
+  // A model that names no output cap, or no working context, of its own gets
+  // this harness's conservative ones, so a route added through the model
+  // dialog — not only the cordis.yml fallback — is safe by default on a
+  // provider like Groq or a free OpenRouter pool, on both halves of what a
+  // request actually costs (what it sends, and what it may get back).
   //
-  // This has to be a per-MODEL `maxTokens`, not the profile's own
+  // maxTokens has to be a per-MODEL field, not the profile's own
   // `defaultMaxTokens`: only a per-model cap becomes the adapter's
   // `configuredMaxTokens` and so the agent loop's actual request default
   // (`llm-pi-ai/adapter.ts`'s `modelInfo` — "Only a cap the deployment
   // configured is a request default; the catalog's `maxTokens` sizes the
   // model and stops there"). A route-level `defaultMaxTokens` only sizes the
   // catalog's own bookkeeping and never reaches the wire request at all,
-  // which is exactly the shape this bug took: the field was set, correctly,
-  // and still had no effect. `models` omitted entirely (the route serves
-  // dsh's installed catalog as-is) is left alone — that catalog's own
+  // which is exactly the shape a real bug here once took: the field was set,
+  // correctly, and still had no effect. `models` omitted entirely (the route
+  // serves dsh's installed catalog as-is) is left alone — that catalog's own
   // capacities are real capabilities, not a gap to fill.
   return Object.fromEntries(
     Object.entries(declared).map(([route, profile]) => [
@@ -217,9 +262,11 @@ export function routeProfiles(
         ? profile
         : {
           ...profile,
-          models: profile.models.map(model => (
-            model.maxTokens === undefined ? { ...model, maxTokens: defaultMaxTokens } : model
-          )),
+          models: profile.models.map(model => ({
+            ...model,
+            ...model.maxTokens === undefined ? { maxTokens: defaultMaxTokens } : {},
+            contextWindow: Math.max(model.contextWindow ?? defaultContextWindow, MIN_CONTEXT_WINDOW),
+          })),
         },
     ]),
   )

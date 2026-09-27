@@ -107,7 +107,7 @@ environment) — no source change:
 AI_MODEL=qwen/qwen3.7-plus            # any OpenAI-compatible model id
 AI_BASE_URL=https://openrouter.ai/api/v1
 AI_CONTEXT_WINDOW=131072              # the working context compaction keeps within
-AI_MAX_TOKENS=8192                    # output tokens one response may use; raise it only
+AI_MAX_TOKENS=2000                    # output tokens one response may use; raise it only
                                        # if your route allows more (Groq, among others,
                                        # rejects a request above its own smaller per-model
                                        # ceiling even when it is under the context window)

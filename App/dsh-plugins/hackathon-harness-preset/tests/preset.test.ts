@@ -52,7 +52,7 @@ async function harness(config: Config = {}, approval?: 'allowed-once' | 'rejecte
   await ctx.plugin(ToolRuntime)
 
   const spend: Spend = { uncachedInputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }
-  ctx.provide('sessionProjections', { stateOf: () => ({ totals: spend }) } as never)
+  ctx.provide('sessionProjections', { stateOf: () => ({ totals: spend }) })
   const skills: RegisteredSkill[] = []
   ctx.provide('skills', {
     register: (definition: RegisteredSkill) => {
@@ -334,7 +334,7 @@ test('a run_wave child may write its own files and is refused any other', async 
 
 test('cancelled waves report every skipped part without starting children', async () => {
   const { ctx } = await harness()
-  ctx.provide('subagents', { start: async () => { throw new Error('must not start') } } as never)
+  ctx.provide('subagents', { start: async () => { throw new Error('must not start') } })
   const tool = ctx.tools.get(RUN_WAVE)!
   const session = ctx.sessions.create(SessionId('cancelled-waves'))
   const abort = new AbortController()
@@ -609,4 +609,29 @@ test('maxConcurrentParts left at its default (0) keeps the whole wave as one bat
     ],
   }, { agent: { session } as unknown as Agent, signal: new AbortController().signal } as never)
   assert.equal(peak, 3, 'no cap configured — the whole wave still runs at once, unchanged from before')
+})
+
+test('the root agent\'s live stream is mirrored to stderr as tagged lines, and a subagent\'s is not', async () => {
+  const { ctx, session } = await harness()
+  const written: string[] = []
+  const original = process.stderr.write.bind(process.stderr)
+  process.stderr.write = ((chunk: string) => { written.push(String(chunk)); return true }) as typeof process.stderr.write
+  try {
+    const root = { session } as unknown as Agent
+    const child = { session: { ...session, id: 'child', header: { ...session.header, parentSession: session.id } } } as unknown as Agent
+    const frame = (chunk: unknown) => ({ type: 'chunk', attemptId: 'a1', revision: 1, index: 0, time: 0, chunk })
+    const emit = ctx.emit.bind(ctx) as unknown as (name: string, payload: unknown) => void
+    emit('agent/assistant-stream', { agent: root, frame: { type: 'start', attemptId: 'a1', revision: 1, turn: 1, step: 1 } })
+    emit('agent/assistant-stream', { agent: root, frame: frame({ type: 'text-delta', index: 0, text: 'Hello' }) })
+    emit('agent/assistant-stream', { agent: root, frame: frame({ type: 'tool-call-delta', index: 1, id: 'c1', name: 'write', argumentsDelta: '{"file_path":"a.py"' }) })
+    emit('agent/assistant-stream', { agent: child, frame: frame({ type: 'text-delta', index: 0, text: 'child text' }) })
+  } finally {
+    process.stderr.write = original
+  }
+  const lines = written.filter(line => line.startsWith(harnessPreset.LIVE_STREAM_TAG))
+  const parsed = lines.map(line => JSON.parse(line.slice(harnessPreset.LIVE_STREAM_TAG.length)) as Record<string, unknown>)
+  assert.deepEqual(parsed.map(line => line.kind), ['start', 'text', 'tool'])
+  assert.equal(parsed[1]?.text, 'Hello')
+  assert.equal(parsed[2]?.name, 'write')
+  assert.ok(!parsed.some(line => line.text === 'child text'), 'a subagent\'s stream stays out of the root transcript')
 })

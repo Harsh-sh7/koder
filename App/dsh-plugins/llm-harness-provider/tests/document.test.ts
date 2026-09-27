@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 
-import { Config, DEFAULT_API_KEY_ENV, DEFAULT_MAX_TOKENS, DEFAULT_MODELS_FILE, UNCONFIGURED_ROUTE, fallbackProfile, plainOptions, resolveDefaultMaxTokens, resolveOptions, routeProfiles, unconfiguredProfile } from '../src/index.ts'
+import { Config, DEFAULT_API_KEY_ENV, DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS, MIN_CONTEXT_WINDOW, DEFAULT_MODELS_FILE, UNCONFIGURED_ROUTE, fallbackProfile, plainOptions, resolveDefaultMaxTokens, resolveOptions, routeProfiles, unconfiguredProfile } from '../src/index.ts'
 import { ModelsDocumentError, documentSignature, parseModelsDocument, readModelsDocument } from '../src/index.ts'
 
 /** A document with one complete route, as the application writes it. */
@@ -189,6 +189,41 @@ test('a route serving the installed catalog as-is (no models declared) is left a
   const document = { qwen: { baseURL: 'https://api.groq.com/openai/v1' } }
   const profiles = routeProfiles(undefined, document)
   assert.equal(profiles.qwen?.models, undefined, "the installed catalog's own capacities are real capabilities, not a gap")
+})
+
+test('a route with no working context of its own gets this harness\'s conservative default too, on any provider', () => {
+  // The other half of the same fix: a route someone added through the model
+  // dialog for a free OpenRouter model, not only a Groq one, must not inherit
+  // an effectively unbounded context window just because it declared none.
+  const document = { pool: fallbackProfile('pool', { baseURL: 'https://openrouter.ai/api/v1', model: 'poolside/laguna-xs-2.1:free' }) }
+  const profiles = routeProfiles(undefined, document)
+  assert.equal(profiles.pool?.models?.[0]?.contextWindow, DEFAULT_CONTEXT_WINDOW)
+})
+
+test('a model that already declares its own context window is left exactly as configured', () => {
+  const declared = fallbackProfile('pool', { baseURL: 'https://openrouter.ai/api/v1', model: 'poolside/laguna-xs-2.1:free', contextWindow: 20_000 })
+  const document = { pool: declared }
+  const profiles = routeProfiles(undefined, document)
+  assert.equal(profiles.pool?.models?.[0]?.contextWindow, 20_000, 'an explicit choice is never overridden')
+})
+
+test('the two conservative defaults are independent: setting one never sets the other', () => {
+  const document = { pool: fallbackProfile('pool', { baseURL: 'https://openrouter.ai/api/v1', model: 'x', maxTokens: 999, contextWindow: 20_000 }) }
+  const profiles = routeProfiles(undefined, document, 111, 40_000)
+  assert.equal(profiles.pool?.models?.[0]?.maxTokens, 999)
+  assert.equal(profiles.pool?.models?.[0]?.contextWindow, 20_000)
+})
+
+test('a context window below the harness\'s own fixed prefix is raised to the floor, even when declared', () => {
+  // Regression pin: a 5k window (and a hand-set 4k one) left the engine an
+  // output budget of window minus a ~5k-token prompt — every request went out
+  // with max_tokens 1, the model thought one word, and the turn stopped dead
+  // with no error.
+  const declared = { tiny: fallbackProfile('tiny', { baseURL: 'https://api.groq.com/openai/v1', model: 'q', contextWindow: 4_000 }) }
+  assert.equal(routeProfiles(undefined, declared).tiny?.models?.[0]?.contextWindow, MIN_CONTEXT_WINDOW)
+  const undeclared = { bare: fallbackProfile('bare', { baseURL: 'https://openrouter.ai/api/v1', model: 'x' }) }
+  assert.equal(routeProfiles(undefined, undeclared, 2_000, 5_000).bare?.models?.[0]?.contextWindow, MIN_CONTEXT_WINDOW)
+  assert.ok(DEFAULT_CONTEXT_WINDOW >= MIN_CONTEXT_WINDOW, 'the default itself must clear the floor')
 })
 
 test('AI_MAX_TOKENS raises or lowers the default for every model that leaves it unset', () => {

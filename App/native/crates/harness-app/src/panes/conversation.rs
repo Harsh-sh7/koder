@@ -71,7 +71,18 @@ pub fn show(state: &mut HarnessState, ui: &mut Ui, area: Rect) {
     } else {
         state.agent.pending.len().min(2) as f32 * 96.0 + 10.0
     };
-    let composer_height = 116.0;
+    // The composer grows by one 24px row per context chip riding above the
+    // prompt (the open file, an attached command) — this has to match
+    // `composer_view`'s own chip count exactly, or the transcript above it is
+    // carved out for a shorter composer than what actually gets drawn, and
+    // the extra chip pushes into (or is squeezed under) the transcript's
+    // bottom edge instead of the composer simply being taller. This is
+    // exactly the shape of "the chat view jumps when I open a file and then
+    // send a prompt": the chip only appears once a file is open, which is
+    // also when you are most likely to be typing something.
+    let composer_chips = usize::from(state.editor.buffer.is_some())
+        + usize::from(state.agent.attached_block.is_some());
+    let composer_height = 116.0 + composer_chips as f32 * 24.0;
 
     let bottom = area.bottom() - 12.0;
     let composer = Rect::from_min_max(
@@ -124,6 +135,7 @@ fn transcript_view(state: &mut HarnessState, ui: &mut Ui, rect: Rect) {
         .map(|entry| (entry.content.clone(), entry.status.clone()))
         .collect();
     let todos = current_todos(&conversation.items);
+    let live = conversation.live.clone();
     let running = conversation.state.busy();
 
     let mut toggle_thinking: Option<usize> = None;
@@ -146,13 +158,17 @@ fn transcript_view(state: &mut HarnessState, ui: &mut Ui, rect: Rect) {
     let welcome = welcome_lines(state);
 
     let output = theme::inside(ui, content, |ui| {
-        let mut area = egui::ScrollArea::vertical()
+        // No `vertical_scroll_offset(f32::MAX)` for the jump: that lays the
+        // whole frame out at an offset of ~3e38 px, so every row is painted
+        // far off-screen and the frame is blank until the offset is clamped
+        // — which, with lazy repaints, can sit on screen long enough to read
+        // as "the chat went blank, then jumped". The jump scrolls to the
+        // content's real bottom after it has been laid out instead (below).
+        let area = egui::ScrollArea::vertical()
             .id_salt("transcript")
             .auto_shrink([false, false])
+            .animated(false)
             .stick_to_bottom(true);
-        if jump {
-            area = area.vertical_scroll_offset(f32::MAX);
-        }
         area.show(ui, |ui| {
             ui.set_width((ui.available_width().min(column) - 12.0).max(1.0));
             // Horizontal notice rows must not enlarge every subsequent card.
@@ -204,11 +220,11 @@ fn transcript_view(state: &mut HarnessState, ui: &mut Ui, rect: Rect) {
                     }
                     Item::Tool(card) => {
                         if card.is_delegation() {
-                            agent_card(ui, card, reveal.as_deref());
+                            agent_card(ui, card, reveal.as_deref(), running);
                         } else if let Some(change) = card.change().filter(|change| {
                             !change.path.is_empty() || !change.removed.is_empty() || !change.added.is_empty()
                         }) {
-                            if change_card(ui, card, &change, reveal.as_deref()) {
+                            if change_card(ui, card, &change, reveal.as_deref(), running) {
                                 open_file = Some(change.path.clone());
                             }
                         } else if card.is_todo_write() && !card.todos().is_empty() {
@@ -217,7 +233,7 @@ fn transcript_view(state: &mut HarnessState, ui: &mut Ui, rect: Rect) {
                             // that updates is the readable shape of a list
                             // the engine replaces whole.
                         } else {
-                            tool_row(ui, card, reveal.as_deref());
+                            tool_row(ui, card, reveal.as_deref(), running);
                         }
                     }
                     // The failure's own notice is what the failure row at the
@@ -230,12 +246,29 @@ fn transcript_view(state: &mut HarnessState, ui: &mut Ui, rect: Rect) {
                 ui.add_space(10.0);
             }
             if !todos.is_empty() {
-                todo_card(ui, &todos);
+                todo_card(ui, &todos, running);
                 ui.add_space(8.0);
             }
             if !plan.is_empty() {
-                plan_card(ui, &plan);
+                plan_card(ui, &plan, running);
                 ui.add_space(8.0);
+            }
+            // The step streaming right now, drawn the way its committed
+            // message will be — reasoning, then the answer growing word by
+            // word, then any tool call whose arguments are still being
+            // written — so a turn reads as it happens instead of flashing in
+            // whole at the end of each step.
+            if let Some(live) = &live {
+                if !live.thought.trim().is_empty() {
+                    thinking_view(ui, &live.thought, false, live.text.trim().is_empty());
+                }
+                if !live.text.trim().is_empty() {
+                    answer(ui, &mut markdown, &live.text, usize::MAX - 1);
+                }
+                for tool in &live.tools {
+                    live_tool_row(ui, tool);
+                }
+                ui.add_space(10.0);
             }
             // The live row: what the engine is doing, right now, at the end
             // of the record. A turn can run for minutes, and a transcript
@@ -261,6 +294,12 @@ fn transcript_view(state: &mut HarnessState, ui: &mut Ui, rect: Rect) {
                 }
             }
             ui.add_space(8.0);
+            if jump && reveal.is_none() {
+                ui.scroll_to_cursor(Some(Align::BOTTOM));
+                // Draw the settled position straight away instead of on the
+                // next idle tick.
+                ui.ctx().request_repaint();
+            }
         })
     });
     state.markdown = markdown;
@@ -537,9 +576,22 @@ fn composer_view(state: &mut HarnessState, ui: &mut Ui, rect: Rect) {
         ui,
         Rect::from_min_max(egui::pos2(text_rect.left(), text_top), text_rect.max),
         |ui| {
+            let prompt_id = egui::Id::new("agent-prompt");
+            // Enter sends; Shift+Enter is the escape hatch for a literal
+            // newline. This has to be decided, and the key consumed, before
+            // the text field below sees the same event — otherwise the field
+            // has already inserted its own newline for a bare Enter by the
+            // time we get to check for one.
+            let mut enter_to_send = false;
+            if ui.memory(|memory| memory.has_focus(prompt_id))
+                && !ui.input(|input| input.modifiers.shift)
+            {
+                enter_to_send =
+                    ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+            }
             let response = ui.add(
                 egui::TextEdit::multiline(&mut state.agent.input)
-                    .id(egui::Id::new("agent-prompt"))
+                    .id(prompt_id)
                     .frame(egui::Frame::NONE)
                     .desired_rows(rows)
                     .desired_width(f32::INFINITY)
@@ -552,12 +604,12 @@ fn composer_view(state: &mut HarnessState, ui: &mut Ui, rect: Rect) {
             {
                 response.request_focus();
             }
-            // ⌘↩ sends; a bare return is a newline, because prompts are paragraphs.
-            if response.has_focus()
+            // ⌘↩ still works too, for the habit of it.
+            let cmd_enter = response.has_focus()
                 && ui.input_mut(|input| {
                     input.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter)
-                })
-            {
+                });
+            if enter_to_send || cmd_enter {
                 send = true;
             }
         },
@@ -824,6 +876,7 @@ fn composer_view(state: &mut HarnessState, ui: &mut Ui, rect: Rect) {
         let text = state.agent.input.trim().to_string();
         if !text.is_empty() {
             state.send_prompt(&text);
+            ui.ctx().request_repaint();
         }
     }
     if open_models {
@@ -1162,6 +1215,46 @@ fn failed_row(ui: &mut Ui, message: &str, can_retry: bool, model: &str) -> Optio
 ///
 /// @param ui the interface to draw into
 /// @param activity what the session is doing
+/// A tool call the model is still writing: what it is about to do, and how
+/// much of it has arrived. A file write is the long one — its whole content
+/// streams through the call's arguments — so its path and a running size are
+/// what make that wait readable.
+///
+/// @param ui the interface to draw into
+/// @param tool the call in progress
+fn live_tool_row(ui: &mut Ui, tool: &harness_core::agent::LiveTool) {
+    let name = tool.name.to_ascii_lowercase();
+    let (icon, verb) = if name.contains("write") || name.contains("edit") || name.contains("patch") {
+        (Icon::NewTask, "Writing")
+    } else if name.contains("bash") || name.contains("shell") || name.contains("exec") {
+        (Icon::Terminal, "Preparing command")
+    } else if name == "run_wave" {
+        (Icon::Harness, "Planning parallel parts")
+    } else {
+        (Icon::Harness, "Calling")
+    };
+    let subject = tool.target().unwrap_or_else(|| {
+        if tool.name.is_empty() { "a tool".to_string() } else { tool.name.clone() }
+    });
+    ui.horizontal(|ui| {
+        theme::spinner(ui, 12.0, theme::ACCENT);
+        ui.add_space(6.0);
+        icons::icon(ui, icon, theme::DIM, 13.0);
+        ui.add_space(4.0);
+        ui.add(
+            egui::Label::new(
+                RichText::new(format!("{verb} {}", shorten(&subject, 80))).size(12.5).color(theme::TEXT),
+            )
+            .truncate(),
+        );
+        ui.label(
+            RichText::new(format!("{} chars", tool.args.chars().count()))
+                .size(11.0)
+                .color(theme::FAINT),
+        );
+    });
+}
+
 fn working_row(ui: &mut Ui, activity: &crate::state::Activity) {
     egui::Frame::new()
         .fill(theme::ELEVATED)
@@ -1269,6 +1362,69 @@ enum Segment<'a> {
     Prose(String),
     /// A fenced block: its info string and its lines.
     Code(&'a str, Vec<&'a str>),
+    /// A markdown pipe table: header cells, then body rows.
+    Table(Vec<String>, Vec<Vec<String>>),
+}
+
+/// Whether a line is a pipe table's separator row (`|---|:--:|`).
+///
+/// @param line the line
+/// @returns true for a separator
+fn is_table_separator(line: &str) -> bool {
+    let cells = table_cells(line);
+    !cells.is_empty()
+        && cells.iter().all(|cell| {
+            let cell = cell.trim_matches(':');
+            cell.len() >= 3 && cell.chars().all(|c| c == '-')
+        })
+}
+
+/// Splits one pipe-table row into its trimmed cells.
+///
+/// @param line the row
+/// @returns the cells, without the outer pipes
+fn table_cells(line: &str) -> Vec<String> {
+    let line = line.trim();
+    let line = line.strip_prefix('|').unwrap_or(line);
+    let line = line.strip_suffix('|').unwrap_or(line);
+    line.split('|').map(|cell| cell.trim().to_string()).collect()
+}
+
+/// Lifts pipe tables out of a prose segment, keeping the prose around them.
+///
+/// @param prose the markdown between fences
+/// @param out where the pieces go, in order
+fn split_tables<'a>(prose: &str, out: &mut Vec<Segment<'a>>) {
+    let lines: Vec<&str> = prose.lines().collect();
+    let mut rest: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let starts = lines[i].contains('|')
+            && i + 1 < lines.len()
+            && is_table_separator(lines[i + 1]);
+        if !starts {
+            rest.push(lines[i]);
+            i += 1;
+            continue;
+        }
+        if !rest.is_empty() {
+            out.push(Segment::Prose(rest.join("\n")));
+            rest.clear();
+        }
+        let header = table_cells(lines[i]);
+        i += 2;
+        let mut rows = Vec::new();
+        while i < lines.len() && lines[i].contains('|') && !lines[i].trim().is_empty() {
+            let mut row = table_cells(lines[i]);
+            row.resize(header.len(), String::new());
+            rows.push(row);
+            i += 1;
+        }
+        out.push(Segment::Table(header, rows));
+    }
+    if !rest.is_empty() {
+        out.push(Segment::Prose(rest.join("\n")));
+    }
 }
 
 /// Splits an answer at its code fences.
@@ -1307,7 +1463,7 @@ fn segments(text: &str) -> Vec<Segment<'_>> {
                 match marker {
                     Some(marker) => {
                         if !prose.is_empty() {
-                            out.push(Segment::Prose(prose.join("\n")));
+                            split_tables(&prose.join("\n"), &mut out);
                             prose.clear();
                         }
                         fence = Some((marker, trimmed[3..].trim(), Vec::new()));
@@ -1321,7 +1477,7 @@ fn segments(text: &str) -> Vec<Segment<'_>> {
         out.push(Segment::Code(info, body));
     }
     if !prose.is_empty() {
-        out.push(Segment::Prose(prose.join("\n")));
+        split_tables(&prose.join("\n"), &mut out);
     }
     out
 }
@@ -1356,8 +1512,78 @@ fn answer(ui: &mut Ui, cache: &mut egui_commonmark::CommonMarkCache, text: &str,
                 code_block(ui, info, &body, ui.id().with(("code", index, block)));
                 ui.add_space(4.0);
             }
+            Segment::Table(header, rows) => {
+                ui.add_space(4.0);
+                table_block(ui, &header, &rows, ui.id().with(("table", index, block)));
+                ui.add_space(4.0);
+            }
         }
     }
+}
+
+/// One table cell's text with its inline markers dropped, and whether it was
+/// written as code (so it keeps a monospace face).
+///
+/// @param cell the raw cell
+/// @returns the display text, and whether it is code
+fn cell_text(cell: &str) -> (String, bool) {
+    let code = cell.len() >= 2 && cell.starts_with('`') && cell.ends_with('`');
+    let text = cell.replace("**", "").replace('`', "");
+    (text, code)
+}
+
+/// A markdown table, drawn as one: a header row, every column as wide as its
+/// widest cell (never wrapped into a sliver), rules between rows, and a
+/// sideways scroll when the whole table is wider than the reading column.
+///
+/// @param ui the interface to draw into
+/// @param header the header cells
+/// @param rows the body rows
+/// @param id a stable id for the block's scroll state
+fn table_block(ui: &mut Ui, header: &[String], rows: &[Vec<String>], id: egui::Id) {
+    /// Longest cell drawn in full; the rest is on hover.
+    const CELL_CHARS: usize = 80;
+    let cell = |ui: &mut Ui, raw: &str, strong: bool| {
+        let (text, code) = cell_text(raw);
+        let shown = shorten(&text, CELL_CHARS);
+        let mut rich = RichText::new(&shown).size(12.5).color(theme::TEXT);
+        if strong {
+            rich = rich.strong();
+        }
+        if code {
+            rich = rich.monospace().size(12.0);
+        }
+        let response = ui.add(egui::Label::new(rich).wrap_mode(egui::TextWrapMode::Extend));
+        if shown != text {
+            response.on_hover_text(text);
+        }
+    };
+    egui::Frame::new()
+        .stroke(Stroke::new(1.0, theme::BORDER))
+        .corner_radius(CornerRadius::same(theme::RADIUS + 2))
+        .inner_margin(egui::Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            egui::ScrollArea::horizontal()
+                .id_salt(id.with("scroll"))
+                .auto_shrink([true, true])
+                .show(ui, |ui| {
+                    egui::Grid::new(id.with("grid"))
+                        .striped(true)
+                        .spacing([22.0, 8.0])
+                        .show(ui, |ui| {
+                            for head in header {
+                                cell(ui, head, true);
+                            }
+                            ui.end_row();
+                            for row in rows {
+                                for value in row {
+                                    cell(ui, value, false);
+                                }
+                                ui.end_row();
+                            }
+                        });
+                });
+        });
 }
 
 /// A fenced block from an answer: its language, a copy button, and its lines
@@ -1444,12 +1670,9 @@ fn code_block(ui: &mut Ui, language: &str, body: &[&str], id: egui::Id) {
 /// @param ui the interface to draw into
 /// @param card the call
 /// @param reveal the call the panel asked to open
-fn tool_row(ui: &mut Ui, card: &ToolCard, reveal: Option<&str>) {
-    let colour = match card.status {
-        ToolStatus::Pending | ToolStatus::Running => theme::AMBER,
-        ToolStatus::Completed => theme::GREEN,
-        ToolStatus::Failed => theme::RED,
-    };
+fn tool_row(ui: &mut Ui, card: &ToolCard, reveal: Option<&str>, live: bool) {
+    let shown = Shown::of(card, live);
+    let colour = shown.colour();
     let escalation = card.is_budget_escalation();
     let open_id = ui.id().with(("tool-open", card.id.as_str()));
     let mut open = ui
@@ -1465,10 +1688,7 @@ fn tool_row(ui: &mut Ui, card: &ToolCard, reveal: Option<&str>) {
         .input_text(&["command", "cmd", "file_path", "path", "pattern", "query", "url", "name"])
         .unwrap_or_else(|| card.summary());
     let verb = tool_verb(card);
-    let elapsed = card
-        .elapsed_ms
-        .map(duration_label)
-        .unwrap_or_default();
+    let elapsed = shown_elapsed(ui, card, shown);
     let has_detail = !card.output.trim().is_empty() || card.input.is_some();
 
     let response = egui::Frame::new()
@@ -1510,7 +1730,7 @@ fn tool_row(ui: &mut Ui, card: &ToolCard, reveal: Option<&str>) {
                     });
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    status_mark(ui, card.status, colour);
+                    status_mark(ui, shown, colour);
                     ui.add_space(6.0);
                     if !elapsed.is_empty() {
                         ui.label(RichText::new(elapsed).size(11.0).color(theme::FAINT));
@@ -1595,18 +1815,93 @@ fn detail(ui: &mut Ui, label: &str, text: &str, colour: egui::Color32, call: &st
 /// @param ui the interface to draw into
 /// @param status the call's status
 /// @param colour the status colour
-fn status_mark(ui: &mut Ui, status: ToolStatus, colour: egui::Color32) {
-    match status {
-        ToolStatus::Pending | ToolStatus::Running => {
+fn status_mark(ui: &mut Ui, shown: Shown, colour: egui::Color32) {
+    match shown {
+        Shown::Running => {
             theme::spinner(ui, 13.0, colour);
         }
-        ToolStatus::Completed => {
+        Shown::Done => {
             icons::icon(ui, Icon::Check, colour, 13.0);
         }
-        ToolStatus::Failed => {
+        Shown::Failed => {
             icons::icon(ui, Icon::Cross, colour, 13.0);
         }
+        Shown::Stopped => {
+            icons::icon(ui, Icon::Stop, colour, 11.0);
+        }
     }
+}
+
+/// How a call's status reads on screen.
+///
+/// The engine's own status is the source, with one display-only rule on
+/// top: a call still marked unfinished after its turn has ended is not
+/// "running" — nothing is working on it any more (the turn was stopped, or
+/// failed before the tool reported back) — so it settles to a quiet
+/// "stopped" instead of spinning forever.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shown {
+    /// Working now: an animated mark and a live clock.
+    Running,
+    /// Finished and succeeded.
+    Done,
+    /// Finished and failed.
+    Failed,
+    /// Left unfinished by a turn that is over.
+    Stopped,
+}
+
+impl Shown {
+    /// @param card the call
+    /// @param live whether its turn is still in flight
+    /// @returns how the call reads
+    fn of(card: &ToolCard, live: bool) -> Self {
+        match card.status {
+            ToolStatus::Completed => Self::Done,
+            ToolStatus::Failed => Self::Failed,
+            ToolStatus::Pending | ToolStatus::Running if live => Self::Running,
+            ToolStatus::Pending | ToolStatus::Running => Self::Stopped,
+        }
+    }
+
+    /// Blue while working (in progress, not a warning), green, red, grey.
+    fn colour(self) -> egui::Color32 {
+        match self {
+            Self::Running => theme::ACCENT,
+            Self::Done => theme::GREEN,
+            Self::Failed => theme::RED,
+            Self::Stopped => theme::FAINT,
+        }
+    }
+
+    /// The status word a card prints.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
+/// The time a card shows: its recorded duration once finished, and a clock
+/// that ticks while it runs — measured from when this card first appeared, so
+/// a long step visibly moves instead of reading as frozen.
+///
+/// @param ui the interface to draw into
+/// @param card the call
+/// @param shown how the call reads
+/// @returns the label, or nothing when there is no time to show
+fn shown_elapsed(ui: &mut Ui, card: &ToolCard, shown: Shown) -> String {
+    if shown != Shown::Running {
+        return card.elapsed_ms.map(duration_label).unwrap_or_default();
+    }
+    let key = egui::Id::new(("card-started", card.id.as_str()));
+    let now = std::time::Instant::now();
+    let started = ui.ctx().data_mut(|data| *data.get_temp_mut_or(key, now));
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+    duration_label(started.elapsed().as_millis() as u64)
 }
 
 /// A duration the way a row prints it: `420 ms`, `3.2 s`, `1 m 04 s`.
@@ -1659,12 +1954,9 @@ fn tool_verb(card: &ToolCard) -> String {
 /// @param ui the interface to draw into
 /// @param card the call
 /// @param reveal the call the panel asked to open
-fn agent_card(ui: &mut Ui, card: &ToolCard, reveal: Option<&str>) {
-    let colour = match card.status {
-        ToolStatus::Pending | ToolStatus::Running => theme::AMBER,
-        ToolStatus::Completed => theme::GREEN,
-        ToolStatus::Failed => theme::RED,
-    };
+fn agent_card(ui: &mut Ui, card: &ToolCard, reveal: Option<&str>, live: bool) {
+    let shown = Shown::of(card, live);
+    let colour = shown.colour();
     let open_id = ui.id().with(("agent-open", card.id.as_str()));
     let mut open = ui
         .ctx()
@@ -1691,12 +1983,13 @@ fn agent_card(ui: &mut Ui, card: &ToolCard, reveal: Option<&str>) {
     let handed = if wave {
         None
     } else {
-        card.input_text(&["prompt", "evidence"])
+        // `command` first: a shell call's own args carry a friendly
+        // `description` (already the headline above) and the literal command
+        // separately — showing the command too, without opening the card, is
+        // what actually answers "what did it run".
+        card.input_text(&["command", "prompt", "evidence"])
     };
-    let elapsed = card
-        .elapsed_ms
-        .map(duration_label)
-        .unwrap_or_default();
+    let elapsed = shown_elapsed(ui, card, shown);
     let result: Vec<&str> = card
         .output
         .lines()
@@ -1751,19 +2044,9 @@ fn agent_card(ui: &mut Ui, card: &ToolCard, reveal: Option<&str>) {
                     });
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    match card.status {
-                        ToolStatus::Pending | ToolStatus::Running => {
-                            icons::icon(ui, Icon::Ring, colour, 13.0);
-                        }
-                        ToolStatus::Completed => {
-                            icons::icon(ui, Icon::Check, colour, 13.0);
-                        }
-                        ToolStatus::Failed => {
-                            icons::icon(ui, Icon::More, colour, 13.0);
-                        }
-                    }
+                    status_mark(ui, shown, colour);
                     ui.add_space(5.0);
-                    ui.label(RichText::new(card.status.label()).size(11.5).color(colour));
+                    ui.label(RichText::new(shown.label()).size(11.5).color(colour));
                     if !elapsed.is_empty() {
                         ui.add_space(6.0);
                         ui.label(RichText::new(elapsed).size(11.0).color(theme::FAINT));
@@ -1800,6 +2083,45 @@ fn agent_card(ui: &mut Ui, card: &ToolCard, reveal: Option<&str>) {
                         .truncate(),
                     );
                 }
+            } else if wave && shown == Shown::Running {
+                // A wave's parts run with no live per-step feed (see
+                // Architecture.md: child sub-agent steps are not forwarded
+                // over ACP) — its own result text is the first thing that
+                // exists to show, and that only lands once the whole call
+                // settles. Naming the parts and saying plainly why nothing
+                // else appears yet beats a blank card that looks stuck.
+                ui.add_space(6.0);
+                let (rule, _) =
+                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
+                ui.painter()
+                    .rect_filled(rule, CornerRadius::same(1), theme::BORDER);
+                ui.add_space(6.0);
+                let names: Vec<String> = card
+                    .input
+                    .as_ref()
+                    .and_then(|input| input.get("parts"))
+                    .and_then(serde_json::Value::as_array)
+                    .map(|parts| {
+                        parts
+                            .iter()
+                            .filter_map(|part| part.get("id").and_then(serde_json::Value::as_str))
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let line = if names.is_empty() {
+                    "Working — each part's own result lands here the moment it finishes; \
+                     nothing streams in before then."
+                        .to_string()
+                } else {
+                    format!(
+                        "Working on: {}. They may run in smaller batches to stay under the route's \
+                         rate limit, so this can take a few minutes — each part's own result lands \
+                         here the moment it finishes; nothing streams in before then.",
+                        names.join(", ")
+                    )
+                };
+                ui.add(egui::Label::new(RichText::new(line).size(11.5).color(theme::DIM)).wrap());
             }
         })
         .response;
@@ -1823,12 +2145,9 @@ fn agent_card(ui: &mut Ui, card: &ToolCard, reveal: Option<&str>) {
 /// @param change the derived change
 /// @param reveal the call the panel asked to open
 /// @returns true when Open was clicked
-fn change_card(ui: &mut Ui, card: &ToolCard, change: &FileChange, reveal: Option<&str>) -> bool {
-    let colour = match card.status {
-        ToolStatus::Pending | ToolStatus::Running => theme::AMBER,
-        ToolStatus::Completed => theme::GREEN,
-        ToolStatus::Failed => theme::RED,
-    };
+fn change_card(ui: &mut Ui, card: &ToolCard, change: &FileChange, reveal: Option<&str>, live: bool) -> bool {
+    let shown = Shown::of(card, live);
+    let colour = shown.colour();
     let open_id = ui.id().with(("change-open", card.id.as_str()));
     let mut open = ui
         .ctx()
@@ -1881,7 +2200,7 @@ fn change_card(ui: &mut Ui, card: &ToolCard, change: &FileChange, reveal: Option
                     {
                         open_file = true;
                     }
-                    status_mark(ui, card.status, colour);
+                    status_mark(ui, shown, colour);
                     ui.add_space(4.0);
                     if !change.removed.is_empty() {
                         ui.label(
@@ -1998,7 +2317,7 @@ fn more_lines(ui: &mut Ui, count: usize) {
 ///
 /// @param ui the interface to draw into
 /// @param todos the (content, status) pairs
-fn todo_card(ui: &mut Ui, todos: &[(String, String)]) {
+fn todo_card(ui: &mut Ui, todos: &[(String, String)], live: bool) {
     let done = todos
         .iter()
         .filter(|(_, status)| status == "completed")
@@ -2021,11 +2340,19 @@ fn todo_card(ui: &mut Ui, todos: &[(String, String)]) {
                 let (mark, colour) = match status.as_str() {
                     "completed" => (Icon::Check, theme::GREEN),
                     "in_progress" => (Icon::Ring, theme::ACCENT),
-                    "cancelled" => (Icon::More, theme::FAINT),
-                    _ => (Icon::Sparkle, theme::FAINT),
+                    "cancelled" => (Icon::Cross, theme::FAINT),
+                    _ => (Icon::Circle, theme::FAINT),
                 };
                 ui.horizontal(|ui| {
-                    icons::icon(ui, mark, colour, 12.0);
+                    // Spinning only while a turn is actually running: an item
+                    // left in progress by a stopped turn is just unfinished.
+                    if status == "in_progress" && live {
+                        theme::spinner(ui, 12.0, colour);
+                    } else if status == "in_progress" {
+                        icons::icon(ui, Icon::Circle, theme::ACCENT, 12.0);
+                    } else {
+                        icons::icon(ui, mark, colour, 12.0);
+                    }
                     ui.add_space(6.0);
                     let mut text = RichText::new(shorten(content, 92))
                         .size(12.5)
@@ -2123,7 +2450,7 @@ fn notice(ui: &mut Ui, level: NoticeLevel, text: &str) {
 ///
 /// @param ui the interface to draw into
 /// @param plan the plan's entries, as content and status
-fn plan_card(ui: &mut Ui, plan: &[(String, String)]) {
+fn plan_card(ui: &mut Ui, plan: &[(String, String)], live: bool) {
     let done = plan
         .iter()
         .filter(|(_, status)| status == "completed")
@@ -2144,11 +2471,19 @@ fn plan_card(ui: &mut Ui, plan: &[(String, String)]) {
                 let (mark, colour) = match status.as_str() {
                     "completed" => (Icon::Check, theme::GREEN),
                     "in_progress" => (Icon::Ring, theme::ACCENT),
-                    "cancelled" => (Icon::More, theme::FAINT),
-                    _ => (Icon::Sparkle, theme::FAINT),
+                    "cancelled" => (Icon::Cross, theme::FAINT),
+                    _ => (Icon::Circle, theme::FAINT),
                 };
                 ui.horizontal(|ui| {
-                    icons::icon(ui, mark, colour, 12.0);
+                    // Spinning only while a turn is actually running: an item
+                    // left in progress by a stopped turn is just unfinished.
+                    if status == "in_progress" && live {
+                        theme::spinner(ui, 12.0, colour);
+                    } else if status == "in_progress" {
+                        icons::icon(ui, Icon::Circle, theme::ACCENT, 12.0);
+                    } else {
+                        icons::icon(ui, mark, colour, 12.0);
+                    }
                     ui.add_space(6.0);
                     ui.label(
                         RichText::new(shorten(content, 90))
@@ -2177,6 +2512,69 @@ fn shorten_lines(text: &str, lines: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn card_with(status: ToolStatus) -> ToolCard {
+        ToolCard {
+            id: "c".into(),
+            title: "run_wave".into(),
+            kind: "other".into(),
+            status,
+            input: None,
+            output: String::new(),
+            locations: Vec::new(),
+            elapsed_ms: None,
+        }
+    }
+
+    #[test]
+    fn an_unfinished_call_spins_only_while_its_turn_is_live_and_settles_to_stopped_after() {
+        // The "stuck loader" bug: a card whose turn ended before the tool
+        // reported back used to read "running" forever.
+        assert!(Shown::of(&card_with(ToolStatus::Running), true) == Shown::Running);
+        assert!(Shown::of(&card_with(ToolStatus::Pending), true) == Shown::Running);
+        assert!(Shown::of(&card_with(ToolStatus::Running), false) == Shown::Stopped);
+        assert_eq!(Shown::Stopped.label(), "stopped");
+    }
+
+    #[test]
+    fn a_finished_call_reads_the_same_whether_or_not_a_turn_is_running() {
+        for live in [true, false] {
+            assert!(Shown::of(&card_with(ToolStatus::Completed), live) == Shown::Done);
+            assert!(Shown::of(&card_with(ToolStatus::Failed), live) == Shown::Failed);
+        }
+    }
+
+    #[test]
+    fn a_pipe_table_is_lifted_out_of_prose_with_its_header_and_rows() {
+        let text = "Before.\n\n| Part | File |\n|------|:----:|\n| core | `todo.py` |\n| docs | README.md |\n\nAfter.";
+        let parts = segments(text);
+        assert!(matches!(&parts[0], Segment::Prose(p) if p.contains("Before.")));
+        let Segment::Table(header, rows) = &parts[1] else { panic!("expected a table") };
+        assert_eq!(header, &vec!["Part".to_string(), "File".to_string()]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], vec!["core".to_string(), "`todo.py`".to_string()]);
+        assert!(matches!(&parts[2], Segment::Prose(p) if p.contains("After.")));
+    }
+
+    #[test]
+    fn a_pipe_in_prose_without_a_separator_row_stays_prose() {
+        let parts = segments("use a | b to pipe\nnothing else");
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(&parts[0], Segment::Prose(_)));
+    }
+
+    #[test]
+    fn a_short_row_is_padded_to_the_header_width() {
+        let parts = segments("| a | b | c |\n|---|---|---|\n| 1 |");
+        let Segment::Table(_, rows) = &parts[0] else { panic!("expected a table") };
+        assert_eq!(rows[0].len(), 3);
+    }
+
+    #[test]
+    fn a_table_inside_a_code_fence_is_left_to_the_code_block() {
+        let parts = segments("```\n| a | b |\n|---|---|\n```");
+        assert!(matches!(&parts[0], Segment::Code(..)));
+    }
 
     #[test]
     fn long_transcript_rows_stay_within_the_reading_column() {

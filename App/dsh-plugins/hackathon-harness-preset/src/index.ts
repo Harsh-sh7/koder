@@ -109,6 +109,12 @@ export const PART_RETRIES = 1
 export const PART_RETRY_DELAY_MS = 2_000
 /** How far apart a wave's parts are staggered on their first attempt. */
 export const PART_START_STAGGER_MS = 400
+/**
+ * Prefix of a live-stream line on stderr. The record-separator control
+ * character never begins an ordinary log line, so the application can split
+ * these out of the engine's log without guessing.
+ */
+export const LIVE_STREAM_TAG = '\u001eharness-live '
 /** Default milliseconds between batches, when a wave is split by `maxConcurrentParts`. */
 export const DEFAULT_INTER_BATCH_DELAY_MS = 20_000
 /** Resolves after `ms` milliseconds. */
@@ -226,6 +232,12 @@ export interface Config {
    * 0.
    */
   interBatchDelayMs?: number
+  /**
+   * Whether the root agent's live output (text, reasoning, and tool-call
+   * arguments as they stream) is mirrored to stderr for the application to
+   * draw progressively. Observation only; defaults to true.
+   */
+  liveStream?: boolean
 }
 
 /** Runtime schema for {@link Config}. */
@@ -249,6 +261,7 @@ export const Config = z.object({
   partStartStaggerMs: z.number().step(1).min(0).default(PART_START_STAGGER_MS),
   maxConcurrentParts: z.number().step(1).min(0).default(0),
   interBatchDelayMs: z.number().step(1).min(0).default(DEFAULT_INTER_BATCH_DELAY_MS),
+  liveStream: z.boolean().default(true),
 })
 
 /** One session's live budget state: what the ceiling currently is and what it has already done. */
@@ -926,6 +939,33 @@ export function apply(ctx: Context, config: Config): void {
     presentCall: () => ({ card: 'generic', title: 'Harness self-check', kind: 'read' }),
     presentResult: () => ({ card: 'generic', title: 'Self-check report' }),
   }))
+
+  // Live output for the application. The ACP bridge only forwards *committed*
+  // messages, so a streamed answer (and a tool call whose arguments carry a
+  // whole file) reached the window in one piece at the end of each step — the
+  // turn looked stuck, then flashed. This listener only observes the root
+  // agent's live stream and mirrors each delta to stderr as one tagged JSON
+  // line, which the application reads beside the ACP channel and draws as a
+  // provisional bubble until the committed message replaces it. It never
+  // touches a request, a tool, the transcript, or the budget.
+  if (config.liveStream ?? true) {
+    ctx.on('agent/assistant-stream', ({ agent, frame }) => {
+      if (agent.session.header.parentSession !== undefined) return
+      const base = { session: String(agent.session.id), attempt: String(frame.attemptId) }
+      let line: Record<string, unknown> | undefined
+      if (frame.type === 'start') line = { ...base, kind: 'start' }
+      else if (frame.type === 'end') line = { ...base, kind: 'end' }
+      else {
+        const chunk = frame.chunk
+        if (chunk.type === 'text-delta' && chunk.text !== '') line = { ...base, kind: 'text', text: chunk.text }
+        else if (chunk.type === 'reasoning-delta' && chunk.text !== '') line = { ...base, kind: 'thought', text: chunk.text }
+        else if (chunk.type === 'tool-call-delta') {
+          line = { ...base, kind: 'tool', id: String(chunk.id), name: chunk.name, text: chunk.argumentsDelta }
+        }
+      }
+      if (line !== undefined) process.stderr.write(`${LIVE_STREAM_TAG}${JSON.stringify(line)}\n`)
+    })
+  }
 
   // One temperature for the whole session, set on the request header rather than
   // per call: the header is what the prompt cache keys on, so a constant value

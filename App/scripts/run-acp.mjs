@@ -60,10 +60,10 @@ const DEFAULT_CONTEXT_WINDOW = '131072'
  * fallback applies whenever a route's config does not set `maxTokens`
  * explicitly — which the default route never did until this was added, so a
  * route on such a provider failed every turn with "max_completion_tokens must
- * be less than or equal to ...". 8192 is comfortably under every such ceiling
+ * be less than or equal to ...". 2000 is comfortably under every such ceiling
  * seen in practice; raise it with AI_MAX_TOKENS for a route that allows more.
  */
-const DEFAULT_MAX_TOKENS = '8192'
+const DEFAULT_MAX_TOKENS = '2000'
 
 /**
  * The harness's own `AI_*` settings from the `.env` files, for the engine's

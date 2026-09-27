@@ -50,6 +50,9 @@ struct Cli {
     /// A dialog to open on, when the caller named one. Like `--pane`, this
     /// exists so a test can photograph a card without a person clicking to it.
     dialog: Option<String>,
+    /// A saved task to reopen at launch, exactly as clicking it in the sidebar
+    /// does — so a test can check a resumed session without a person clicking.
+    task: Option<String>,
     /// The window's opening size, so a test can photograph the layout at a
     /// narrow width without a person dragging the window edge.
     size: Option<[f32; 2]>,
@@ -67,6 +70,7 @@ impl Default for Cli {
             shot_delay: 3.0,
             pane: None,
             dialog: None,
+            task: None,
             size: None,
         }
     }
@@ -105,6 +109,10 @@ impl Cli {
                 "--dialog" => match args.next() {
                     Some(value) => cli.dialog = Some(value),
                     None => ignored.push("--dialog without a name".to_string()),
+                },
+                "--task" => match args.next() {
+                    Some(value) => cli.task = Some(value),
+                    None => ignored.push("--task without an id".to_string()),
                 },
                 "--size" => match args.next().as_deref().and_then(parse_size) {
                     Some(size) => cli.size = Some(size),
@@ -216,6 +224,7 @@ fn main() -> eframe::Result {
     });
     let pane = cli.pane;
     let dialog = cli.dialog.clone();
+    let task = cli.task.clone();
     eframe::run_native(
         "AI Harness",
         options,
@@ -227,6 +236,9 @@ fn main() -> eframe::Result {
                 cli.ask.clone(),
                 shot,
             );
+            if let Some(task) = task.as_deref() {
+                app.state.open_task(task);
+            }
             if let Some(pane) = pane {
                 app.state.pane = pane;
             }

@@ -293,33 +293,49 @@ fn group(
                 {
                     *restage = Some((change.path.clone(), action));
                 }
-                ui.label(RichText::new(change.kind.label()).size(9.5).color(colour));
+                // A secrets file is the one thing in this list that must never
+                // be committed by accident, so it says so instead of "untracked".
+                let name_only = change.path.rsplit('/').next().unwrap_or(&change.path);
+                let secret = name_only == ".env" || name_only.starts_with(".env.");
+                if secret {
+                    ui.label(RichText::new("has keys").size(9.5).color(theme::RED))
+                        .on_hover_text("holds API keys — keep it out of commits");
+                } else {
+                    ui.label(RichText::new(change.kind.label()).size(9.5).color(colour));
+                }
                 ui.add_space(6.0);
-                // A path is cut in the middle rather than at its end, so the file
-                // name — the part that says which file this is — survives.
-                let (advance, _) = code::metrics(ui, &theme::mono(11.5));
+                // The file name first and whole, its folder after it and dimmer:
+                // when the row is too narrow it is the folder that gets cut, never
+                // the name that says which file this is.
+                let (dir, name) = match change.path.rsplit_once('/') {
+                    Some((dir, name)) => (dir, name),
+                    None => ("", change.path.as_str()),
+                };
+                let mut job = egui::text::LayoutJob::default();
+                job.append(
+                    name,
+                    0.0,
+                    egui::TextFormat::simple(
+                        theme::mono(11.5),
+                        if selected { theme::TEXT } else { theme::TEXT.gamma_multiply(0.85) },
+                    ),
+                );
+                if !dir.is_empty() {
+                    job.append(dir, 8.0, egui::TextFormat::simple(theme::mono(10.5), theme::FAINT));
+                }
                 let room = ui.available_width();
-                let fit = ((room / advance).floor() as usize).saturating_sub(2);
-                let shown = shorten(&format!("{} {}", change.kind.letter(), change.path), fit);
                 // Given the whole of the room left over rather than just the width
                 // of its text: a label in a right-to-left layout ends where it is
                 // placed, which would right-align a column of paths of different
                 // lengths.
                 let label = ui.add_sized(
                     [room, 18.0],
-                    egui::Label::new(
-                        RichText::new(shown)
-                            .size(11.5)
-                            .monospace()
-                            .color(if selected { theme::TEXT } else { theme::DIM }),
-                    )
-                    .sense(Sense::click())
-                    .truncate(),
+                    egui::Label::new(job).sense(Sense::click()).truncate(),
                 );
                 if label.clicked() {
                     *select = Some((change.path.clone(), staged));
                 }
-                label.on_hover_text(change.kind.label());
+                label.on_hover_text(format!("{} · {}", change.path, change.kind.label()));
             });
         });
     }

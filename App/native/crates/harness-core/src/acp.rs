@@ -177,6 +177,23 @@ pub enum AgentEvent {
         /// The raw method name, when it had one.
         method: String,
     },
+    /// One live-stream delta, mirrored on the engine's stderr by the harness
+    /// preset: provisional output shown while a step streams, replaced by the
+    /// committed message the ACP channel delivers when the step settles.
+    Live {
+        /// Session id (the root agent's; subagents are not mirrored).
+        session_id: String,
+        /// The model attempt this delta belongs to.
+        attempt: String,
+        /// `start`, `text`, `thought`, `tool`, or `end`.
+        kind: String,
+        /// The delta itself (text, reasoning, or tool-argument fragment).
+        text: String,
+        /// Tool-call id, for `tool` deltas.
+        call_id: String,
+        /// Tool name, when this `tool` delta carries it.
+        name: Option<String>,
+    },
     /// The engine's stderr produced a line.
     EngineLog {
         /// The line, verbatim.
@@ -206,11 +223,34 @@ impl AgentEvent {
             | Self::ToolCall { session_id, .. }
             | Self::ToolCallUpdate { session_id, .. }
             | Self::Plan { session_id, .. }
-            | Self::Usage { session_id, .. } => session_id.as_str(),
+            | Self::Usage { session_id, .. }
+            | Self::Live { session_id, .. } => session_id.as_str(),
             _ => return None,
         };
         (!id.is_empty()).then_some(id)
     }
+}
+
+/// Prefix of a live-stream line on the engine's stderr (see the harness
+/// preset's `LIVE_STREAM_TAG`); a record separator never begins a log line.
+pub const LIVE_STREAM_TAG: &str = "\u{1e}harness-live ";
+
+/// Reads one stderr line as a live-stream delta, when it is one.
+///
+/// @param line the stderr line
+/// @returns the event, or `None` for an ordinary log line (or a malformed one)
+pub fn parse_live_line(line: &str) -> Option<AgentEvent> {
+    let body = line.strip_prefix(LIVE_STREAM_TAG)?;
+    let value: Value = serde_json::from_str(body).ok()?;
+    let field = |key: &str| value.get(key).and_then(Value::as_str).unwrap_or_default().to_string();
+    Some(AgentEvent::Live {
+        session_id: field("session"),
+        attempt: field("attempt"),
+        kind: field("kind"),
+        text: field("text"),
+        call_id: field("id"),
+        name: value.get("name").and_then(Value::as_str).map(str::to_string),
+    })
 }
 
 /// One session configuration option the engine advertises.
@@ -366,6 +406,10 @@ impl AcpClient {
                 for line in BufReader::new(stderr).lines() {
                     let Ok(line) = line else { break };
                     if line.trim().is_empty() {
+                        continue;
+                    }
+                    if let Some(event) = parse_live_line(&line) {
+                        let _ = log_events.send(event);
                         continue;
                     }
                     let _ = log_events.send(AgentEvent::EngineLog { line });
@@ -1021,4 +1065,24 @@ fn config_options(value: Option<&Value>) -> Vec<ConfigOption> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_tagged_stderr_line_is_a_live_delta_and_anything_else_is_a_log_line() {
+        let line = format!("{LIVE_STREAM_TAG}{{\"session\":\"s\",\"attempt\":\"a\",\"kind\":\"tool\",\"id\":\"c\",\"name\":\"write\",\"text\":\"{{\"}}");
+        match parse_live_line(&line) {
+            Some(AgentEvent::Live { session_id, attempt, kind, call_id, name, text }) => {
+                assert_eq!((session_id.as_str(), attempt.as_str(), kind.as_str(), call_id.as_str()), ("s", "a", "tool", "c"));
+                assert_eq!(name.as_deref(), Some("write"));
+                assert_eq!(text, "{");
+            }
+            other => panic!("expected a live delta, got {other:?}"),
+        }
+        assert!(parse_live_line("dsh: harness-live is just text here").is_none());
+        assert!(parse_live_line(&format!("{LIVE_STREAM_TAG}not json")).is_none());
+    }
 }

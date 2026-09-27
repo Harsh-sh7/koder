@@ -98,12 +98,12 @@ fn tabs(state: &mut HarnessState, ui: &mut Ui) {
             if let Some(shell) = state.shells.get(state.active_shell) {
                 let terminal = shell.terminal.as_ref();
                 if let Some(terminal) = terminal {
-                    let integration = if terminal.is_integrated() {
-                        "blocks"
-                    } else {
-                        "screen only"
-                    };
-                    ui.label(RichText::new(integration).size(10.5).color(theme::FAINT));
+                    // Only the unusual case is worth a word: a shell without the
+                    // integration cannot be split into blocks.
+                    if !terminal.is_integrated() {
+                        ui.label(RichText::new("screen only").size(10.5).color(theme::FAINT))
+                            .on_hover_text("this shell has no block integration, so its output is one screen");
+                    }
                     if let Some(title) = terminal.title() {
                         ui.label(
                             RichText::new(shorten(&title, 28))
@@ -112,7 +112,8 @@ fn tabs(state: &mut HarnessState, ui: &mut Ui) {
                         );
                     }
                     if terminal.at_prompt() {
-                        ui.label(RichText::new("at prompt").size(10.5).color(theme::GREEN));
+                        ui.label(RichText::new("ready").size(10.5).color(theme::GREEN))
+                            .on_hover_text("the shell is at its prompt, waiting for a command");
                     }
                 }
                 if terminal.is_none() {
