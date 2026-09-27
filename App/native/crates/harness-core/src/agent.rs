@@ -17,6 +17,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::acp::{AgentEvent, ConfigChoice, ConfigOption, PlanEntry, ToolCall};
@@ -70,7 +71,7 @@ impl RunState {
 }
 
 /// Lifecycle of one tool call card.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolStatus {
     /// Announced, not started.
     Pending,
@@ -119,7 +120,14 @@ impl ToolStatus {
 }
 
 /// Tool names that mean "work handed to another agent".
-const DELEGATION_TOOLS: [&str; 5] = ["subagent", "subagent_fork", "task", "agent", "committee"];
+const DELEGATION_TOOLS: [&str; 6] = [
+    "subagent",
+    "subagent_fork",
+    "task",
+    "agent",
+    "committee",
+    "run_wave",
+];
 
 /// Tool names that mean "a command ran".
 const COMMAND_TOOLS: [&str; 6] = [
@@ -143,7 +151,7 @@ pub struct FileChange {
 }
 
 /// One tool call, as the card draws it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCard {
     /// Protocol call id, the key updates arrive under.
     pub id: String,
@@ -360,7 +368,7 @@ impl ToolCard {
 }
 
 /// Severity of a transcript notice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NoticeLevel {
     /// Neutral information.
     Info,
@@ -371,7 +379,7 @@ pub enum NoticeLevel {
 }
 
 /// One transcript entry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Item {
     /// The user's own message.
     User {
@@ -578,6 +586,50 @@ impl Conversation {
         }
     }
 
+    /// Rebuilds a conversation from a saved transcript, so a task opened from
+    /// history reads exactly as it did — and its tool cards keep taking updates
+    /// if the engine resumes the session they belong to.
+    ///
+    /// Streams are closed and the run is idle: whatever was in flight when the
+    /// task was saved is over, and a restored card still marked running is
+    /// shown as failed rather than spinning forever.
+    ///
+    /// @param id identity within the app
+    /// @param session_id the engine session the transcript belongs to, when known
+    /// @param items the saved transcript
+    /// @returns the restored conversation
+    pub fn restore(id: ConversationId, session_id: Option<String>, mut items: Vec<Item>) -> Self {
+        let mut conversation = Self::new(id);
+        for item in &mut items {
+            if let Item::Tool(card) = item {
+                if !card.status.done() {
+                    card.status = ToolStatus::Failed;
+                }
+            }
+            if let Item::Assistant { thinking_open, .. } = item {
+                *thinking_open = false;
+            }
+        }
+        for (index, item) in items.iter().enumerate() {
+            if let Item::Tool(card) = item {
+                conversation.cards.insert(card.id.clone(), index);
+            }
+        }
+        conversation.session_id = session_id;
+        conversation.items = items;
+        conversation
+    }
+
+    /// The first thing the user asked, which is what a task is called.
+    ///
+    /// @returns the first user message, or `None` before one was sent
+    pub fn first_prompt(&self) -> Option<&str> {
+        self.items.iter().find_map(|item| match item {
+            Item::User { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+    }
+
     /// Records the user's prompt locally, so the transcript shows it before the
     /// engine answers (the engine does not echo prompts back).
     ///
@@ -678,9 +730,16 @@ impl Conversation {
     /// @returns whether the transcript, plan, or state changed visibly
     pub fn apply(&mut self, event: &AgentEvent) -> bool {
         match event {
-            AgentEvent::Initialized { name, version } => {
-                self.engine_name = name.clone();
-                self.engine_version = version.clone();
+            AgentEvent::Initialized { name: _, version: _ } => {
+                // The wire's own `agentInfo` names the vendored engine directly
+                // (its ACP handshake hardcodes its own package name and an
+                // internal version that is never bumped); every place that
+                // reads `engine_name`/`engine_version` is a label the user
+                // reads (the footer, the turn-failed card, the observability
+                // panel, the exported transcript), so it carries this
+                // application's own identity instead of the dependency's.
+                self.engine_name = "AI Harness engine".to_string();
+                self.engine_version = env!("CARGO_PKG_VERSION").to_string();
                 true
             }
             AgentEvent::SessionReady {
@@ -1117,6 +1176,26 @@ mod tests {
             }],
         });
         conversation
+    }
+
+    #[test]
+    fn the_displayed_engine_identity_never_carries_the_vendored_dependency_s_own_name() {
+        // The vendored engine's ACP handshake hardcodes its own package name
+        // and an internal version it never bumps (`agentInfo: { name:
+        // "deepseek-harness-acp", version: "0.0.1" }`); every UI surface that
+        // shows `engine_name`/`engine_version` (the footer, the turn-failed
+        // card, the observability panel, an exported transcript) must show
+        // this application's own identity, not that string, however the wire
+        // ever spells it.
+        let mut conversation = Conversation::new(ConversationId(1));
+        conversation.apply(&AgentEvent::Initialized {
+            name: "deepseek-harness-acp".to_string(),
+            version: "0.0.1".to_string(),
+        });
+        assert!(!conversation.engine_name.to_lowercase().contains("deepseek"));
+        assert!(!conversation.engine_name.to_lowercase().contains("dsh"));
+        assert_eq!(conversation.engine_name, "AI Harness engine");
+        assert_eq!(conversation.engine_version, env!("CARGO_PKG_VERSION"));
     }
 
     #[test]

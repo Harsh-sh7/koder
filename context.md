@@ -110,10 +110,10 @@ Each has a reason; do not relitigate without reading it.
 | **Native Rust application, our own renderer** (eframe/egui 0.36) | The deliverable is a product, not a web page. A real PTY and real OS integration were required, and the engine is a local process on stdio. |
 | **egui, not a custom wgpu renderer** | Immediate mode maps onto "UI is a function of state" with no retained-tree bookkeeping, and it renders offscreen, which is how every UI claim in this repo is photographed and verified. |
 | **The engine is dsh behind ACP, unmodified** | The harness must *use* the upstream agent engine, not reimplement it. All of our behaviour is mounted as plugins, which keeps the upstream checkout pristine and upgradable. |
-| **No model ships with the composition** | A route is data (`AI_API_KEY` + `.harness/models.json`), and the composition mounts off every shipped route. A fresh clone opens sessions on the provider's placeholder route and says "add a model" instead of erroring. |
+| **One default route, overridable as data** | The composition mounts off every shipped route and declares one default: OpenRouter's DeepSeek, replaced by `AI_MODEL`/`AI_BASE_URL` (env or `.env`) or a workspace's `.harness/models.json` `active` entry. A fresh clone with only `AI_API_KEY` runs — which is what an evaluator will do. |
 | **`AI_API_KEY` is the only credential** | One key, one place it is read (the provider plugin). dsh's DeepSeek-branded providers expect `DEEPSEEK_API_KEY` and are mounted **off**. |
 | **Light theme only, Qoder-style shell** | The UI is a deliberate clone of the owner's daily driver: sidebar with the literal Qoder labels, the centre card, the live session panel. |
-| **Budget is enforced by the composition, not requested from the model** | A 400k cap, a warn-at 80%, a per-turn step cap, and at most two approved escalations. A runaway run costs a bounded amount and then stops. |
+| **Budget is enforced by the composition, not requested from the model** | A per-prompt (per-issue) cap of 1.5M weighted tokens — prompt-cache reads count at 0.1 — a 90-step turn cap, a warning at 80% of either, and at most two approved escalations (a step-cap grant buys steps). A runaway run costs a bounded amount and then stops; one expensive issue cannot starve the next. |
 | **Reviewers are `spawn`ed children, not forks** | A fork hands every reviewer the parent's whole context; paying for that three times is exactly the cost the committee exists to avoid. |
 
 ## 6. What exists today, and how it is proven
@@ -157,12 +157,13 @@ The work queue lives in `takeover.md` §6. The headline items:
   is a real delegated sub-task running to completion through the app.
 - **Token / time / context efficiency features** — see the queue; this is the
   owner's first priority and the reason the handover exists.
-- **Responsive layout** — the window's panels are fixed-width today
-  (sidebar 236, session panel 312). The owner started this and handed it over.
+- **Responsive layout** — done: widths come from `theme::columns`; below
+  1040pt the sidebar folds to an icon rail, and when the card would drop under
+  520pt the session panel floats over it (stopping above the composer).
 - **No initial commit yet** — the repository has no commits; everything is
   untracked. Do not commit without being asked.
-- **Demo route** — the harness ships no model, so a demo needs either a real key
-  in `.env` or the mock (`App/probe/mock-openai.mjs`).
+- **Demo route** — a real run needs `AI_API_KEY` in `.env` (OpenRouter by
+  default); offline demos use the mock (`App/probe/mock-openai.mjs`).
 
 ## 8. Docs map
 

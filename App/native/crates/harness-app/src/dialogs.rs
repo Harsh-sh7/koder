@@ -98,7 +98,7 @@ fn models(state: &mut HarnessState, ctx: &egui::Context, draft: &mut ModelDraft)
         .collapsible(false)
         .resizable(true)
         .default_width(520.0)
-        .default_pos(egui::pos2(ctx.content_rect().center().x - 260.0, 90.0))
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 90.0))
         .show(ctx, |ui| {
             ui.label(
                 RichText::new("a route is a provider, its API root, and the models it serves. The key is read from the environment; pasting one below writes it to the workspace .env, which git ignores — never to models.json.")
@@ -244,7 +244,7 @@ fn workflow(state: &mut HarnessState, ctx: &egui::Context, draft: &mut WorkflowD
         .collapsible(false)
         .resizable(true)
         .default_width(540.0)
-        .default_pos(egui::pos2(ctx.content_rect().center().x - 270.0, 90.0))
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 90.0))
         .show(ctx, |ui| {
             egui::Grid::new("workflow-fields").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
                 ui.label(RichText::new("name").size(11.0).color(theme::DIM));
@@ -395,7 +395,7 @@ fn note(state: &mut HarnessState, ctx: &egui::Context, draft: &mut NoteDraft) ->
         .collapsible(false)
         .resizable(true)
         .default_width(480.0)
-        .default_pos(egui::pos2(ctx.content_rect().center().x - 240.0, 110.0))
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 110.0))
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("name").size(11.0).color(theme::DIM));
@@ -481,7 +481,7 @@ fn folder(state: &mut HarnessState, ctx: &egui::Context, draft: &mut FolderDraft
         .collapsible(false)
         .resizable(true)
         .default_width(560.0)
-        .default_pos(egui::pos2(ctx.content_rect().center().x - 280.0, 80.0))
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 80.0))
         .show(ctx, |ui| {
             ui.label(
                 RichText::new("the harness works in one folder at a time: the tree, the editor, the shells, and the agent's tool calls all point at it. Opening another folder starts a fresh session — the model route carries over when the new folder has none.")
@@ -600,7 +600,7 @@ fn about(ctx: &egui::Context) -> bool {
         .collapsible(false)
         .resizable(false)
         .default_width(460.0)
-        .default_pos(egui::pos2(ctx.content_rect().center().x - 230.0, 120.0))
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 120.0))
         .show(ctx, |ui| {
             ui.label(RichText::new("A coding harness with a terminal in it.").size(12.5).color(theme::TEXT));
             ui.add_space(4.0);

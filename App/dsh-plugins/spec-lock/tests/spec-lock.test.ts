@@ -25,6 +25,7 @@ import {
   Config,
   DEFAULT_MAX_INLINE_CHARS,
   DEFAULT_MIN_CHARS,
+  DEFAULT_REFREEZE_MIN_CHARS,
   SPEC_LOCK_SOURCE,
   applySpecLockEvent,
   digestOf,
@@ -60,11 +61,11 @@ function amendment(text: string): UserMessage {
 }
 
 /** One session with the real store and registry, and the spec lock folded over it. */
-async function harness(minChars = DEFAULT_MIN_CHARS): Promise<{ ctx: Context; session: Session }> {
+async function harness(minChars = DEFAULT_MIN_CHARS, refreezeMinChars?: number): Promise<{ ctx: Context; session: Session }> {
   const ctx = new Context()
   await ctx.plugin(SessionStore)
   await ctx.plugin(SessionProjectionRegistry)
-  ctx.sessionProjections.register(specLockProjection(minChars))
+  ctx.sessionProjections.register(specLockProjection(minChars, refreezeMinChars))
   return { ctx, session: ctx.sessions.create(SessionId('spec-locked')) }
 }
 
@@ -96,6 +97,27 @@ test('the first substantial user-authored message freezes as the spec', async ()
   assert.ok((state.lockedAt ?? 0) > 0)
   assert.equal(state.amendedAt, null)
   assert.equal(state.amendments, 0)
+})
+
+test('a later substantial prompt is a new task and re-freezes the spec; a short follow-up does not', async () => {
+  const { ctx, session } = await harness(DEFAULT_MIN_CHARS, 40)
+  append(session, userAuthored('Issue 1: the parser drops the last line of every input file.'))
+  append(session, userAuthored('continue'))
+  assert.equal(stateOf(ctx, session).text, 'Issue 1: the parser drops the last line of every input file.')
+  append(session, userAuthored('Issue 2: the CLI exits 0 when the config file cannot be read at all.'))
+  const state = stateOf(ctx, session)
+  assert.equal(state.text, 'Issue 2: the CLI exits 0 when the config file cannot be read at all.')
+  assert.equal(state.digest, digestOf(state.text))
+  // A restatement of the old spec is context, never a new task.
+  append(session, restatement('Frozen session spec restated.', digestOf('Issue 1')))
+  assert.equal(stateOf(ctx, session).text, state.text)
+})
+
+test('with re-freezing off, the first spec holds for the whole session', async () => {
+  const { ctx, session } = await harness(DEFAULT_MIN_CHARS, undefined)
+  append(session, userAuthored('Build me a terminal harness with a token meter.'))
+  append(session, userAuthored('A second, much longer instruction that would otherwise be a brand new task entirely.'))
+  assert.equal(stateOf(ctx, session).text, 'Build me a terminal harness with a token meter.')
 })
 
 test('context this plugin and others inject cannot become the spec', async () => {
@@ -250,4 +272,5 @@ test('the configuration defaults to restating every non-empty spec in full', () 
   const resolved = new Config({}) as Config
   assert.equal(resolved.maxInlineChars, DEFAULT_MAX_INLINE_CHARS)
   assert.equal(resolved.minChars, DEFAULT_MIN_CHARS)
+  assert.equal(resolved.refreezeMinChars, DEFAULT_REFREEZE_MIN_CHARS)
 })

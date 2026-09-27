@@ -189,6 +189,30 @@ pub enum AgentEvent {
     },
 }
 
+impl AgentEvent {
+    /// The engine session a streamed event belongs to.
+    ///
+    /// Events that answer the app's own requests carry no session (the app
+    /// knows what it asked); only the session update stream names one. The app
+    /// uses this to keep a background session's late updates out of the
+    /// transcript of the task on screen.
+    ///
+    /// @returns the session id, when the event names one
+    pub fn session(&self) -> Option<&str> {
+        let id = match self {
+            Self::AgentMessage { session_id, .. }
+            | Self::AgentThought { session_id, .. }
+            | Self::UserMessage { session_id, .. }
+            | Self::ToolCall { session_id, .. }
+            | Self::ToolCallUpdate { session_id, .. }
+            | Self::Plan { session_id, .. }
+            | Self::Usage { session_id, .. } => session_id.as_str(),
+            _ => return None,
+        };
+        (!id.is_empty()).then_some(id)
+    }
+}
+
 /// One session configuration option the engine advertises.
 #[derive(Debug, Clone)]
 pub struct ConfigOption {
@@ -239,6 +263,9 @@ pub struct PlanEntry {
     pub status: String,
 }
 
+/// The ACP method that reopens a persisted session.
+pub const RESUME_METHOD: &str = "session/resume";
+
 /// Handle to one running engine process.
 ///
 /// Dropping the handle kills the engine: an app that has gone away must not
@@ -276,6 +303,9 @@ impl AcpClient {
             .current_dir(&paths.repo_root)
             .env("DSH_HOME", &paths.dsh_home)
             .env("HARNESS_WORKSPACE", workspace)
+            // Re-read on launch so an edited key is not shadowed by the copy
+            // loaded into the GUI process at startup.
+            .envs(crate::config::dotenv_values(workspace))
             .env("TSX_TSCONFIG_PATH", paths.dsh_repo.join("tsconfig.json"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -409,7 +439,45 @@ impl AcpClient {
     /// @param workspace session working directory
     /// @returns the request id
     pub fn new_session(&self, workspace: &str) -> i64 {
-        self.request("session/new", json!({ "cwd": workspace, "mcpServers": [] }))
+        self.new_session_with(workspace, &[])
+    }
+
+    /// `session/new` with the workspace's MCP servers attached.
+    ///
+    /// @param workspace session working directory
+    /// @param mcp_servers servers in ACP's `mcpServers` list form
+    /// @returns the request id
+    pub fn new_session_with(&self, workspace: &str, mcp_servers: &[Value]) -> i64 {
+        self.request(
+            "session/new",
+            json!({ "cwd": workspace, "mcpServers": mcp_servers }),
+        )
+    }
+
+    /// `session/resume` — reopens a session the engine persisted, with its whole
+    /// history, so a task opened from the app's history continues where it
+    /// stopped instead of starting a cold session.
+    ///
+    /// The session id travels in the pending entry's name
+    /// (`session/resume#<id>`): the engine's reply carries only the options, and
+    /// the app needs to know which session came back.
+    ///
+    /// @param session_id the persisted session to reopen
+    /// @param workspace the session's working directory
+    /// @returns the request id
+    pub fn resume_session(&self, session_id: &str, workspace: &str, mcp_servers: &[Value]) -> i64 {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        self.pending
+            .lock()
+            .expect("pending map")
+            .insert(id, format!("{RESUME_METHOD}#{session_id}"));
+        self.send(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": RESUME_METHOD,
+            "params": { "sessionId": session_id, "cwd": workspace, "mcpServers": mcp_servers },
+        }));
+        id
     }
 
     /// `session/prompt` — sends a user turn.
@@ -430,9 +498,14 @@ impl AcpClient {
     /// `session/cancel` — asks the engine to stop the running turn.
     ///
     /// @param session_id session to cancel
-    /// @returns the request id
-    pub fn cancel(&self, session_id: &str) -> i64 {
-        self.request("session/cancel", json!({ "sessionId": session_id }))
+    pub fn cancel(&self, session_id: &str) {
+        // ACP defines `session/cancel` as a notification: sent with an id, the
+        // engine answers "method not found" and the turn keeps running.
+        self.send(json!({
+            "jsonrpc": "2.0",
+            "method": "session/cancel",
+            "params": { "sessionId": session_id },
+        }));
     }
 
     /// `session/set_config_option` — selects a model (or another advertised option).
@@ -462,12 +535,16 @@ impl Drop for AcpClient {
         let (closed, _) = channel();
         drop(std::mem::replace(&mut self.outbound, closed));
         if let Ok(mut guard) = self.child.lock() {
-            if let Some(child) = guard.as_mut() {
-                if !wait_briefly(child, Duration::from_secs(5)) {
-                    log::warn!("acp: engine ignored stdin EOF; killing it");
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
+            if let Some(mut child) = guard.take() {
+                // Reaping a slow engine must not freeze the window during a
+                // route change, workspace switch, or application shutdown.
+                thread::spawn(move || {
+                    if !wait_briefly(&mut child, Duration::from_secs(5)) {
+                        log::warn!("acp: engine ignored stdin EOF; killing it");
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                });
             }
         }
     }
@@ -570,6 +647,17 @@ fn dispatch_line(
                     let session_id = result
                         .get("sessionId")
                         .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let config_options = config_options(result.get("configOptions"));
+                    let _ = events.send(AgentEvent::SessionReady {
+                        session_id: session_id.to_string(),
+                        config_options,
+                    });
+                }
+                resumed if resumed.starts_with(RESUME_METHOD) => {
+                    let session_id = resumed
+                        .split_once('#')
+                        .map(|(_, id)| id)
                         .unwrap_or_default();
                     let config_options = config_options(result.get("configOptions"));
                     let _ = events.send(AgentEvent::SessionReady {

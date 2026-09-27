@@ -268,6 +268,9 @@ pub struct HarnessConfig {
     /// Whether the file-tree column starts open.
     #[serde(default)]
     pub tree_open: bool,
+    /// Whether the sidebar starts expanded.
+    #[serde(default = "default_true")]
+    pub sidebar_open: bool,
     /// Caps mirrored for display.
     #[serde(default)]
     pub caps: CapsConfig,
@@ -290,6 +293,7 @@ impl Default for HarnessConfig {
             terminal_font_size: default_terminal_font_size(),
             agent_panel_open: true,
             tree_open: false,
+            sidebar_open: true,
             caps: CapsConfig::default(),
         }
     }
@@ -528,6 +532,25 @@ pub fn load_dotenv_over(root: &Path) -> Vec<String> {
     apply_dotenv(root, true)
 }
 
+/// Validate a provider endpoint before storing it or sending a request.
+/// @param value the endpoint entered in the route editor
+/// @returns the trimmed endpoint, or a repair message without echoing credentials
+pub fn validate_base_url(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    let invalid = "the base URL must be an absolute http:// or https:// URL with a host";
+    if value.chars().any(char::is_whitespace) || !(value.starts_with("http://") || value.starts_with("https://")) {
+        return Err(invalid.into());
+    }
+    let parsed = url::Url::parse(value).map_err(|_| invalid.to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err(invalid.into());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() || parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("the base URL must not contain credentials, a query, or a fragment; enter the API key separately".into());
+    }
+    Ok(value.trim_end_matches('/').to_string())
+}
+
 /// Reads `<root>/.env` and applies its `AI_*` pairs.
 ///
 /// @param root directory that may contain a `.env` file
@@ -535,30 +558,35 @@ pub fn load_dotenv_over(root: &Path) -> Vec<String> {
 /// @returns names of the variables that were applied
 fn apply_dotenv(root: &Path, override_existing: bool) -> Vec<String> {
     let mut applied = Vec::new();
-    let Ok(raw) = std::fs::read_to_string(root.join(".env")) else {
-        return applied;
-    };
-    for line in raw.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let key = key.trim();
-        let value = value.trim().trim_matches('"').trim_matches('\'');
-        if !key.starts_with("AI_") || value.is_empty() {
-            continue;
-        }
-        if override_existing || std::env::var_os(key).is_none() {
-            // The app sets its own environment before any thread reads it; the
-            // engine child inherits exactly what is set here.
-            std::env::set_var(key, value);
-            applied.push(key.to_string());
+    for (key, value) in dotenv_values(root) {
+        if override_existing || std::env::var_os(&key).is_none() {
+            std::env::set_var(&key, value);
+            applied.push(key);
         }
     }
     applied
+}
+
+/// Read workspace settings without changing the application's global environment.
+/// @param root directory holding the optional dotenv file
+/// @returns AI settings to pass directly to a newly launched engine
+pub fn dotenv_values(root: &Path) -> BTreeMap<String, String> {
+    let raw = std::fs::read_to_string(root.join(".env")).unwrap_or_default();
+    raw.lines().filter_map(|line| {
+        let line = line.trim().strip_prefix("export ").unwrap_or(line.trim());
+        let (key, value) = line.split_once('=')?;
+        let key = key.trim();
+        if !key.starts_with("AI_") || !key.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_') {
+            return None;
+        }
+        let value = value.trim();
+        let value = if value.len() >= 2 && ((value.starts_with('"') && value.ends_with('"')) || (value.starts_with('\'') && value.ends_with('\''))) {
+            &value[1..value.len() - 1]
+        } else {
+            value.split(" #").next().unwrap_or(value).trim_end()
+        };
+        Some((key.to_string(), value.to_string()))
+    }).collect()
 }
 
 /// Writes one `KEY=value` pair into `<root>/.env`, creating the file when it is
@@ -634,6 +662,16 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("harness-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn endpoint_validation_rejects_bad_urls_without_echoing_secrets() {
+        for bad in ["", "openrouter.ai/api/v1", "https://", "file:///tmp/api", "https://host/v1 secret", "https://secret@host/v1", "https://host/v1?key=secret"] {
+            let error = validate_base_url(bad).unwrap_err();
+            assert!(!error.contains("secret"));
+        }
+        assert_eq!(validate_base_url(" https://openrouter.ai/api/v1/ ").unwrap(), "https://openrouter.ai/api/v1");
+        assert!(validate_base_url("http://127.0.0.1:8899/v1").is_ok());
     }
 
     #[test]

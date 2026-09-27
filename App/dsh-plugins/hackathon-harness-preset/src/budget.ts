@@ -30,19 +30,21 @@ export interface TokenTotals {
   readonly cacheWriteTokens: number
 }
 
-/** The live ceiling of one session's budget. */
+/** The live ceiling of one budget. */
 export interface BudgetLimits {
-  /** Model tokens the session may spend in total. */
+  /** Model tokens the budget's scope may spend in total. */
   readonly tokens: number
   /** Model steps one turn may take before the harness stops it. */
   readonly stepsPerTurn: number
-  /** Fraction of {@link BudgetLimits.tokens} at which the model is warned once. */
+  /** Fraction of {@link BudgetLimits.tokens} (and of the step cap) at which the model is warned once. */
   readonly warnAt: number
+  /** What the token ceiling covers, as the stop sentence names it. Defaults to `session`. */
+  readonly scope?: 'turn' | 'session'
 }
 
-/** What the session has spent so far. */
+/** What the budget's scope has spent so far. */
 export interface BudgetUsage {
-  /** Model tokens the session has spent, from {@link totalTokens}. */
+  /** Model tokens spent in the budget's scope, from {@link weightedTokens}. */
   readonly tokens: number
   /** Model steps this turn has taken. */
   readonly stepsInTurn: number
@@ -58,7 +60,7 @@ export interface BudgetUsage {
  */
 export type BudgetDecision =
   | { readonly kind: 'ok' }
-  | { readonly kind: 'warn'; readonly text: string }
+  | { readonly kind: 'warn'; readonly over: 'tokens' | 'steps'; readonly text: string }
   | { readonly kind: 'stop'; readonly over: 'tokens' | 'steps'; readonly text: string }
 
 /**
@@ -68,6 +70,23 @@ export type BudgetDecision =
  */
 export function totalTokens(totals: TokenTotals): number {
   return totals.uncachedInputTokens + totals.outputTokens + totals.cacheReadTokens + totals.cacheWriteTokens
+}
+
+/**
+ * The spend a budget counts: every bucket, with prompt-cache reads weighted.
+ *
+ * An agent loop re-sends its whole prefix on every step, so on a route with a
+ * prompt cache most input tokens are cache reads — billed and computed at a
+ * small fraction of fresh input. Counting them at full weight made a budget
+ * that stopped a turn after a dozen steps of perfectly cheap work; weighting
+ * them keeps the cap on the work that actually costs.
+ * @param totals - the usage buckets.
+ * @param cacheReadWeight - what one cache-read token counts as, 0 to 1.
+ * @returns the weighted spend.
+ */
+export function weightedTokens(totals: TokenTotals, cacheReadWeight: number): number {
+  return totals.uncachedInputTokens + totals.outputTokens + totals.cacheWriteTokens
+    + totals.cacheReadTokens * cacheReadWeight
 }
 
 /**
@@ -94,11 +113,12 @@ export function formatCount(value: number): string {
  * @returns the decision, with the text the caller either admits or records.
  */
 export function decideBudget(limits: BudgetLimits, usage: BudgetUsage): BudgetDecision {
+  const scope = limits.scope === 'turn' ? 'Turn' : 'Session'
   if (usage.tokens >= limits.tokens) {
     return {
       kind: 'stop',
       over: 'tokens',
-      text: `Session budget exhausted: ${formatCount(usage.tokens)} of ${formatCount(limits.tokens)} model tokens spent`
+      text: `${scope} budget exhausted: ${formatCount(usage.tokens)} of ${formatCount(limits.tokens)} model tokens spent`
         + ` (${formatCount(usage.stepsInTurn)} steps into this turn).`,
     }
   }
@@ -114,8 +134,20 @@ export function decideBudget(limits: BudgetLimits, usage: BudgetUsage): BudgetDe
     const percent = Math.floor((usage.tokens / limits.tokens) * 100)
     return {
       kind: 'warn',
+      over: 'tokens',
       text: `Harness budget: ${percent}% spent (${formatCount(usage.tokens)} of ${formatCount(limits.tokens)} model tokens).`
         + ' Finish the subtask in progress and report; do not start new work.',
+    }
+  }
+  // The step cap warns too: a turn that is simply stopped mid-edit leaves a
+  // half-applied change and no report, which is the worst way for a turn to end.
+  const stepWarningAt = Math.max(1, Math.floor(limits.warnAt * limits.stepsPerTurn))
+  if (usage.stepsInTurn >= stepWarningAt) {
+    return {
+      kind: 'warn',
+      over: 'steps',
+      text: `Harness budget: step ${formatCount(usage.stepsInTurn)} of a ${formatCount(limits.stepsPerTurn)}-step turn.`
+        + ' Converge now: run the check that proves the change, then report; do not start new exploration.',
     }
   }
   return { kind: 'ok' }

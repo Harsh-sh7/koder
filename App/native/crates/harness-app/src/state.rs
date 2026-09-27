@@ -16,13 +16,14 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 use harness_core::acp::{AcpClient, AgentEvent, AgentRequest, ConfigChoice, PermissionOption};
-use harness_core::agent::{Conversation, NoticeLevel, RunState};
+use harness_core::agent::{Conversation, Item, NoticeLevel, RunState};
 use harness_core::config::{
     EnginePaths, HarnessConfig, ModelsDocument, Price, Prices, ProviderModel, ProviderProfile,
 };
 use harness_core::event::{ConversationId, CoreEvent, TerminalId};
 use harness_core::fsops::{self, DirListing, FileText, SearchOptions, SearchOutcome};
 use harness_core::git::{BranchInfo, CommitInfo, GitRepo, RepoStatus};
+use harness_core::tasks::{TaskRecord, TaskStore, TaskSummary};
 use harness_core::term::{
     write_shell_integration, BlockSummary, ScreenSize, Terminal, TerminalOptions,
 };
@@ -42,6 +43,53 @@ const BLOCK_PROMPT_LIMIT: usize = 6_000;
 
 /// Patch lines above which the diff opens collapsed.
 const COMPACT_DIFF_LINES: usize = 1_200;
+
+/// How often a task with unsaved changes is written while a turn runs, so a
+/// crash mid-turn loses seconds of transcript rather than the turn.
+const TASK_SAVE_EVERY: Duration = Duration::from_secs(5);
+
+/// Longest a turn may wait for its session before it is failed outright. The
+/// engine's own cold start is a handful of seconds; well past a minute means
+/// something is stuck, not merely slow.
+const SESSION_START_TIMEOUT: Duration = Duration::from_secs(75);
+
+/// How many back/forward steps the navigation history keeps.
+const NAV_DEPTH: usize = 64;
+
+/// How long the skills and MCP lists are trusted before the disk is read again.
+const EXTENSIONS_TTL: Duration = Duration::from_secs(15);
+
+/// What the agent can be extended with, as last read from disk.
+pub struct Extensions {
+    /// Skills a session can load.
+    pub skills: Vec<harness_core::extensions::Skill>,
+    /// MCP servers the workspace declares, or why its document is unreadable.
+    pub mcp: Result<Vec<harness_core::extensions::McpServer>, String>,
+    /// When they were read.
+    pub read_at: Instant,
+}
+
+/// One file the task created or changed, for the panel's artifact list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Artifact {
+    /// The path the call named.
+    pub path: String,
+    /// Lines added across the task.
+    pub added: usize,
+    /// Lines removed across the task.
+    pub removed: usize,
+    /// The last call that touched it, to reveal.
+    pub call_id: String,
+}
+
+/// One place the back and forward arrows can return to: a task and a view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NavEntry {
+    /// The task on screen, `None` for an unsaved new task.
+    pub task: Option<String>,
+    /// The view in the centre card.
+    pub pane: Pane,
+}
 
 /// A tool name with its first letter raised, for a panel row.
 ///
@@ -91,6 +139,21 @@ pub fn elapsed_label(elapsed: Duration) -> String {
 pub fn describe_failure(message: &str) -> String {
     let lower = message.to_lowercase();
     let detail = provider_detail(message);
+    if lower.contains("free-models-per-day") || lower.contains("openrouter_free_tier_daily") {
+        let reset = message.find('{')
+            .and_then(|at| serde_json::from_str::<serde_json::Value>(&message[at..]).ok())
+            .and_then(|body| body.pointer("/metadata/headers/X-RateLimit-Reset")?.as_str()?.parse::<i64>().ok())
+            .and_then(chrono::DateTime::from_timestamp_millis)
+            .map(|time| format!(" The reported reset is {} UTC.", time.format("%Y-%m-%d %H:%M")))
+            .unwrap_or_default();
+        return format!("the account's daily free-model quota is exhausted (429). Switching free models or keys on the same account will not reset it. Wait for the daily reset, or choose a route with available quota (⌘,).{reset}");
+    }
+    if lower.contains("invalid url") || lower.contains("base url must") || lower.contains("baseurl must") {
+        return "the route's base URL is invalid. Open models and routes (⌘,) and enter the complete API base URL, including https:// and the provider's API path.".to_string();
+    }
+    if lower.contains("finish_reason: error") {
+        return "the provider ended its response with an error and supplied no further detail. This is not evidence of a bad API key. Retry once, or choose another route (⌘,).".to_string();
+    }
     if lower.contains("429") || lower.contains("rate-limited") || lower.contains("rate limit") {
         let advice = "the route is rate-limited upstream (429). Try again in a moment, or pick another route (⌘,).";
         return match detail {
@@ -176,6 +239,58 @@ fn prose_tail(text: &str, limit: usize) -> String {
     match tail.find(' ') {
         Some(cut) => format!("…{}", tail[cut + 1..].trim_start()),
         None => format!("…{tail}"),
+    }
+}
+
+/// An answer's opening as plain sentences, for the panel's summary card.
+///
+/// The card is a glance at what the agent last said, so it keeps the prose and
+/// drops what only reads rendered: fenced blocks, table rows, heading and list
+/// markers, emphasis, and inline-code ticks.
+///
+/// @param text the answer, in markdown
+/// @param limit the most characters to keep
+/// @returns the summary
+pub fn plain_summary(text: &str, limit: usize) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut fenced = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced || trimmed.is_empty() || trimmed.starts_with('|') || trimmed.starts_with("---") {
+            continue;
+        }
+        let heading = trimmed.starts_with('#');
+        let bare = trimmed
+            .trim_start_matches('#')
+            .trim_start_matches(['-', '*', '+', '>'])
+            .trim_start();
+        let bare = bare
+            .split_once(". ")
+            .filter(|(number, _)| !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()))
+            .map(|(_, rest)| rest)
+            .unwrap_or(bare);
+        let mut line = bare.replace("**", "").replace('`', "");
+        // A heading is a sentence of its own once the markers are gone.
+        if heading && !line.ends_with(['.', ':', '!', '?']) {
+            line.push('.');
+        }
+        out.push(line);
+        if out.iter().map(String::len).sum::<usize>() > limit {
+            break;
+        }
+    }
+    let joined = out.join(" ");
+    if joined.chars().count() <= limit {
+        return joined;
+    }
+    let cut: String = joined.chars().take(limit).collect();
+    match cut.rfind(' ') {
+        Some(space) => format!("{}…", &cut[..space]),
+        None => format!("{cut}…"),
     }
 }
 
@@ -290,6 +405,8 @@ pub struct Delegation {
     pub call_id: String,
     /// Whether the run has settled.
     pub done: bool,
+    /// Whether it settled badly: a failed call, or a part reported failed.
+    pub failed: bool,
 }
 
 /// Where a background process row comes from.
@@ -644,6 +761,17 @@ pub struct AgentState {
     pub auto_approve: bool,
     /// A question the agent is being asked to answer from the terminal.
     pub attached_block: Option<String>,
+    /// A saved session to reopen as soon as the engine is ready, instead of a
+    /// fresh one — set when a task is opened from history before the engine
+    /// is up.
+    pub resume: Option<String>,
+    /// Sessions this engine process has open, so switching back to a task
+    /// whose session is still live needs no resume.
+    pub live_sessions: HashSet<String>,
+    /// The requested route a restart has already been tried for, so a route
+    /// this engine process never ends up serving restarts once and then
+    /// reports the mismatch instead of restarting forever.
+    pub route_restart_attempted: Option<String>,
 }
 
 /// The editor for a saved workflow.
@@ -1004,6 +1132,32 @@ pub struct HarnessState {
     pub sink: Sender<CoreEvent>,
     /// Monotonic terminal ids.
     next_terminal: u64,
+    /// The workspace's saved tasks, newest first.
+    pub tasks: Vec<TaskSummary>,
+    /// The task on screen, once it has been saved (after its first prompt).
+    pub current_task: Option<String>,
+    /// When the task on screen began.
+    task_created: Option<String>,
+    /// The name the user gave the task on screen, when they renamed it.
+    task_title: Option<String>,
+    /// Whether the transcript changed since the task was last written.
+    task_dirty: bool,
+    /// When the task was last written.
+    task_saved_at: Instant,
+    /// Whether the sidebar is expanded.
+    pub sidebar_open: bool,
+    /// Where back and forward go.
+    pub nav: Vec<NavEntry>,
+    /// The entry on screen, an index into [`HarnessState::nav`].
+    pub nav_index: usize,
+    /// A task being renamed in place: its id and the name being typed.
+    pub renaming: Option<(String, String)>,
+    /// Skills and MCP servers, cached so the panel does not scan disks per frame.
+    pub extensions: Extensions,
+    /// Parsed-markdown cache for the transcript's answers.
+    pub markdown: egui_commonmark::CommonMarkCache,
+    /// Set when the transcript should jump to its newest line on the next frame.
+    pub scroll_to_bottom: bool,
 }
 
 impl HarnessState {
@@ -1064,6 +1218,9 @@ impl HarnessState {
                 applied_model: None,
                 auto_approve: false,
                 attached_block: None,
+                resume: None,
+                live_sessions: HashSet::new(),
+                route_restart_attempted: None,
             },
             workflows,
             notes: Vec::new(),
@@ -1081,12 +1238,394 @@ impl HarnessState {
             core,
             sink,
             next_terminal: 1,
+            tasks: TaskStore::for_workspace(&root).list(),
+            current_task: None,
+            task_created: None,
+            task_title: None,
+            task_dirty: false,
+            task_saved_at: Instant::now(),
+            sidebar_open: config.sidebar_open,
+            nav: vec![NavEntry {
+                task: None,
+                pane: Pane::Conversation,
+            }],
+            nav_index: 0,
+            renaming: None,
+            extensions: Extensions {
+                skills: Vec::new(),
+                mcp: Ok(Vec::new()),
+                // Stale from the start, so the first frame that asks reads them.
+                read_at: Instant::now() - EXTENSIONS_TTL * 2,
+            },
+            markdown: egui_commonmark::CommonMarkCache::default(),
+            scroll_to_bottom: false,
             root,
             dsh_home,
         };
         state.refresh_notes();
         state.new_shell();
         state
+    }
+
+    /// The task files of the open workspace.
+    ///
+    /// @returns the store
+    pub fn task_store(&self) -> TaskStore {
+        TaskStore::for_workspace(&self.root)
+    }
+
+    /// Skills and MCP servers, re-read when the cached copy is old.
+    ///
+    /// @returns the current lists
+    pub fn extensions(&mut self) -> &Extensions {
+        if self.extensions.read_at.elapsed() >= EXTENSIONS_TTL {
+            let home = self.paths.as_ref().ok().map(|paths| paths.dsh_home.clone());
+            self.extensions = Extensions {
+                skills: harness_core::extensions::skills(&self.root, home.as_deref()),
+                mcp: harness_core::extensions::mcp_servers(&self.root),
+                read_at: Instant::now(),
+            };
+        }
+        &self.extensions
+    }
+
+    /// The files this task created or changed, in the order first touched.
+    ///
+    /// @returns one row per path, with the lines added and removed across the task
+    pub fn artifacts(&self) -> Vec<Artifact> {
+        let mut rows: Vec<Artifact> = Vec::new();
+        for item in &self.agent.conversation.items {
+            let Item::Tool(card) = item else { continue };
+            // A wave's parts were built by its children, whose own calls never
+            // reach this transcript: the files each finished part owned are what
+            // it produced.
+            for part in wave_parts(card).into_iter().filter(|part| part.done && !part.failed) {
+                for file in wave_files(card, &part.agent) {
+                    if !rows.iter().any(|row| row.path == file) {
+                        rows.push(Artifact {
+                            path: file,
+                            added: 0,
+                            removed: 0,
+                            call_id: card.id.clone(),
+                        });
+                    }
+                }
+            }
+            let Some(change) = card.change().filter(|change| !change.path.is_empty()) else {
+                continue;
+            };
+            match rows.iter_mut().find(|row| row.path == change.path) {
+                Some(row) => {
+                    row.added += change.added.len();
+                    row.removed += change.removed.len();
+                    row.call_id = card.id.clone();
+                }
+                None => rows.push(Artifact {
+                    path: change.path.clone(),
+                    added: change.added.len(),
+                    removed: change.removed.len(),
+                    call_id: card.id.clone(),
+                }),
+            }
+        }
+        rows
+    }
+
+    /// Stops the running turn.
+    ///
+    /// The engine settles the turn itself (`cancelled`), which is what ends the
+    /// run state; saying so here keeps the transcript honest in between.
+    pub fn stop_turn(&mut self) {
+        if !self.agent.conversation.state.busy() {
+            return;
+        }
+        match (
+            self.agent.client.as_ref(),
+            self.agent.conversation.session_id.as_ref(),
+        ) {
+            (Some(client), Some(session)) => {
+                client.cancel(session);
+                self.agent
+                    .conversation
+                    .notice(NoticeLevel::Info, "stopping — the engine is ending the turn");
+            }
+            _ => self.agent.conversation.state = RunState::Idle,
+        }
+        self.task_dirty = true;
+    }
+
+    /// The workspace's MCP servers in ACP's list form, for a session request.
+    ///
+    /// A document that does not parse sends no servers and says why once in
+    /// the log; a session without its tools beats no session at all.
+    ///
+    /// @returns the servers to attach
+    pub fn mcp_wire(&self) -> Vec<serde_json::Value> {
+        match harness_core::extensions::mcp_servers(&self.root) {
+            Ok(servers) => servers.into_iter().map(|server| server.wire).collect(),
+            Err(err) => {
+                log::warn!("mcp: {err}");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Re-reads the workspace's task list.
+    pub fn refresh_tasks(&mut self) {
+        self.tasks = self.task_store().list();
+    }
+
+    /// Writes the task on screen to its file, when there is anything to keep.
+    ///
+    /// A task exists from its first prompt: a conversation with nothing asked
+    /// is not history. The name follows the first prompt until the user renames
+    /// the task, and the engine session id rides along so reopening the task
+    /// resumes the model's context rather than starting cold.
+    pub fn save_task(&mut self) {
+        let Some(first) = self.agent.conversation.first_prompt().map(str::to_string) else {
+            return;
+        };
+        let now = chrono::Local::now().to_rfc3339();
+        let id = self
+            .current_task
+            .get_or_insert_with(TaskStore::new_id)
+            .clone();
+        let created = self.task_created.get_or_insert_with(|| now.clone()).clone();
+        let renamed = self.task_title.is_some();
+        let record = TaskRecord {
+            id,
+            title: self
+                .task_title
+                .clone()
+                .unwrap_or_else(|| TaskStore::title_for(&first)),
+            renamed,
+            created,
+            updated: now,
+            session_id: self.agent.conversation.session_id.clone(),
+            route: self.active_route.clone(),
+            items: self.agent.conversation.items.clone(),
+        };
+        match self.task_store().save(&record) {
+            Ok(()) => {
+                self.task_dirty = false;
+                self.task_saved_at = Instant::now();
+                self.refresh_tasks();
+            }
+            Err(err) => log::warn!("tasks: {err}"),
+        }
+    }
+
+    /// Opens a saved task: its transcript on screen, and its engine session
+    /// resumed so the next prompt continues with the model's full context.
+    ///
+    /// A turn still running in the task being left is cancelled first: its
+    /// updates would otherwise stream into a transcript nobody is looking at.
+    ///
+    /// @param id the task to open
+    pub fn open_task(&mut self, id: &str) {
+        if self.current_task.as_deref() == Some(id) {
+            self.pane = Pane::Conversation;
+            self.spot = SidebarSpot::Task;
+            return;
+        }
+        let record = match self.task_store().load(id) {
+            Ok(record) => record,
+            Err(err) => {
+                self.toast(format!("could not open that task: {err}"));
+                self.refresh_tasks();
+                return;
+            }
+        };
+        self.leave_task();
+        let next = ConversationId(self.agent.conversation.id.0 + 1);
+        let mut conversation = Conversation::restore(next, None, record.items);
+        conversation.engine_name = self.agent.conversation.engine_name.clone();
+        conversation.engine_version = self.agent.conversation.engine_version.clone();
+        self.agent.conversation = conversation;
+        self.current_task = Some(record.id.clone());
+        self.task_created = Some(record.created);
+        self.task_title = record.renamed.then_some(record.title);
+        self.task_dirty = false;
+        self.pane = Pane::Conversation;
+        self.spot = SidebarSpot::Task;
+        self.last_activity = chrono::Local::now();
+        self.scroll_to_bottom = true;
+        self.agent.last_prompt = self
+            .agent
+            .conversation
+            .items
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                Item::User { text, .. } => Some(text.clone()),
+                _ => None,
+            });
+        match record.session_id {
+            Some(session) if self.agent.live_sessions.contains(&session) => {
+                // Still open in this engine: nothing to reopen.
+                self.agent.conversation.session_id = Some(session);
+            }
+            Some(session) => match self.agent.client.as_ref() {
+                Some(client) => {
+                    let mcp = self.mcp_wire();
+                    client.resume_session(&session, &self.root.to_string_lossy(), &mcp);
+                }
+                None => {
+                    self.agent.resume = Some(session);
+                    self.ensure_engine();
+                }
+            },
+            None => self.open_session(),
+        }
+        self.record_nav();
+    }
+
+    /// Saves the task on screen and stops anything it still has running.
+    fn leave_task(&mut self) {
+        if self.agent.conversation.state.busy() {
+            if let (Some(client), Some(session)) = (
+                self.agent.client.as_ref(),
+                self.agent.conversation.session_id.as_ref(),
+            ) {
+                client.cancel(session);
+            }
+            self.agent
+                .conversation
+                .notice(NoticeLevel::Warn, "stopped: another task was opened");
+            self.agent.conversation.state = RunState::Idle;
+        }
+        self.save_task();
+        self.agent.pending.clear();
+        self.agent.input.clear();
+        self.agent.pending_input = None;
+        self.agent.last_prompt = None;
+        self.agent.attached_block = None;
+        self.agent.resume = None;
+        self.reveal_call = None;
+        self.renaming = None;
+    }
+
+    /// Opens a fresh engine session for the conversation on screen.
+    fn open_session(&mut self) {
+        match (self.agent.client.as_ref(), self.agent.starting) {
+            (Some(client), _) => {
+                client.new_session_with(&self.root.to_string_lossy(), &self.mcp_wire());
+            }
+            (None, false) => self.ensure_engine(),
+            (None, true) => {}
+        }
+    }
+
+    /// Renames a saved task, or the task on screen.
+    ///
+    /// @param id the task
+    /// @param title the new name
+    pub fn rename_task(&mut self, id: &str, title: &str) {
+        let title = title.trim();
+        if title.is_empty() {
+            self.toast("a task needs a name");
+            return;
+        }
+        if self.current_task.as_deref() == Some(id) {
+            self.task_title = Some(title.to_string());
+            self.save_task();
+            return;
+        }
+        if let Err(err) = self.task_store().rename(id, title) {
+            self.toast(err);
+        }
+        self.refresh_tasks();
+    }
+
+    /// Deletes a saved task; deleting the one on screen starts a new task.
+    ///
+    /// @param id the task
+    pub fn delete_task(&mut self, id: &str) {
+        if let Err(err) = self.task_store().delete(id) {
+            self.toast(err);
+        }
+        if self.current_task.as_deref() == Some(id) {
+            // Nothing of the deleted task may be written back by the switch.
+            self.current_task = None;
+            self.agent.conversation.items.clear();
+            self.new_task();
+        }
+        self.nav.retain(|entry| entry.task.as_deref() != Some(id));
+        if self.nav.is_empty() {
+            self.nav.push(NavEntry {
+                task: self.current_task.clone(),
+                pane: self.pane,
+            });
+        }
+        self.nav_index = self.nav_index.min(self.nav.len() - 1);
+        self.refresh_tasks();
+        self.toast("task deleted");
+    }
+
+    /// Records where the window is now, for back and forward.
+    ///
+    /// Moving somewhere new after going back drops the entries ahead, the way
+    /// a browser's history does.
+    pub fn record_nav(&mut self) {
+        let entry = NavEntry {
+            task: self.current_task.clone(),
+            pane: self.pane,
+        };
+        if self.nav.get(self.nav_index) == Some(&entry) {
+            return;
+        }
+        self.nav.truncate(self.nav_index + 1);
+        self.nav.push(entry);
+        if self.nav.len() > NAV_DEPTH {
+            self.nav.remove(0);
+        }
+        self.nav_index = self.nav.len() - 1;
+    }
+
+    /// Whether back has somewhere to go.
+    ///
+    /// @returns true when an earlier entry exists
+    pub fn can_go_back(&self) -> bool {
+        self.nav_index > 0
+    }
+
+    /// Whether forward has somewhere to go.
+    ///
+    /// @returns true when a later entry exists
+    pub fn can_go_forward(&self) -> bool {
+        self.nav_index + 1 < self.nav.len()
+    }
+
+    /// Moves through the navigation history by one step.
+    ///
+    /// @param forward true for forward, false for back
+    pub fn navigate(&mut self, forward: bool) {
+        let target = if forward {
+            self.nav_index + 1
+        } else {
+            match self.nav_index.checked_sub(1) {
+                Some(index) => index,
+                None => return,
+            }
+        };
+        let Some(entry) = self.nav.get(target).cloned() else {
+            return;
+        };
+        self.nav_index = target;
+        // Opening a task, or starting a new one, records its own entry; the
+        // step taken here must stand, so the history is put back after it.
+        let (nav, index) = (self.nav.clone(), target);
+        match &entry.task {
+            Some(id) if self.current_task.as_deref() != Some(id.as_str()) => {
+                self.open_task(id);
+            }
+            None if self.current_task.is_some() => self.new_task(),
+            _ => {}
+        }
+        self.nav = nav;
+        self.nav_index = index;
+        self.pane = entry.pane;
+        self.spot = SidebarSpot::Task;
     }
 
     /// Says something in the status bar for a few seconds.
@@ -1110,6 +1649,7 @@ impl HarnessState {
     pub fn save_config(&mut self) {
         self.config.tree_open = self.tree_open;
         self.config.agent_panel_open = self.agent_open;
+        self.config.sidebar_open = self.sidebar_open;
         if let Err(err) = self.config.save(&self.root) {
             log::warn!("config: {err}");
         }
@@ -1121,6 +1661,11 @@ impl HarnessState {
     /// and the meter starts over with it, because the budget it reports is the
     /// session's, not the process's.
     pub fn new_task(&mut self) {
+        self.leave_task();
+        self.current_task = None;
+        self.task_created = None;
+        self.task_title = None;
+        self.task_dirty = false;
         let next = self.agent.conversation.id.0 + 1;
         let mut conversation = Conversation::new(ConversationId(next));
         conversation.engine_name = self.agent.conversation.engine_name.clone();
@@ -1136,20 +1681,9 @@ impl HarnessState {
         self.pane = Pane::Conversation;
         self.spot = SidebarSpot::Task;
         self.last_activity = chrono::Local::now();
-        match (self.agent.client.as_ref(), self.agent.starting) {
-            (Some(client), _) => {
-                let workspace = self.root.to_string_lossy().into_owned();
-                client.new_session(&workspace);
-                self.agent
-                    .conversation
-                    .notice(NoticeLevel::Info, "opening a new session");
-            }
-            (None, false) => self.ensure_engine(),
-            (None, true) => self
-                .agent
-                .conversation
-                .notice(NoticeLevel::Info, "waiting for the engine"),
-        }
+        // The engine answers with SessionReady; nothing needs saying before then.
+        self.open_session();
+        self.record_nav();
     }
 
     /// Opens the folder picker on the current workspace.
@@ -1181,8 +1715,9 @@ impl HarnessState {
             self.toast("that folder is already open");
             return;
         }
-        // The old workspace keeps the layout it was left in.
+        // The old workspace keeps the layout it was left in, and its task.
         self.save_config();
+        self.leave_task();
         let previous = std::mem::replace(&mut self.root, root.clone());
         let applied = harness_core::config::load_dotenv_over(&root);
         if !applied.is_empty() {
@@ -1260,7 +1795,19 @@ impl HarnessState {
         self.agent.requested_route = self.active_route.clone();
         self.agent.applied_model = None;
         self.agent.attached_block = None;
+        self.agent.live_sessions.clear();
         self.reveal_call = None;
+        self.current_task = None;
+        self.task_created = None;
+        self.task_title = None;
+        self.task_dirty = false;
+        self.tasks = TaskStore::for_workspace(&root).list();
+        self.nav = vec![NavEntry {
+            task: None,
+            pane: Pane::Conversation,
+        }];
+        self.nav_index = 0;
+        self.sidebar_open = self.config.sidebar_open;
 
         self.workflows = WorkflowStore::load(&HarnessConfig::workflows_dir_for(&root));
         self.refresh_notes();
@@ -1289,6 +1836,9 @@ impl HarnessState {
     ///
     /// @returns the title shown on the conversation's title row
     pub fn session_title(&self) -> String {
+        if let Some(title) = &self.task_title {
+            return title.clone();
+        }
         for item in &self.agent.conversation.items {
             if let harness_core::agent::Item::User { text, .. } = item {
                 let line = text
@@ -1297,7 +1847,7 @@ impl HarnessState {
                     .unwrap_or("")
                     .trim();
                 if !line.is_empty() {
-                    return line.chars().take(64).collect();
+                    return TaskStore::title_for(line);
                 }
             }
         }
@@ -1321,21 +1871,28 @@ impl HarnessState {
             .conversation
             .items
             .iter()
-            .filter_map(|item| match item {
+            .flat_map(|item| match item {
                 harness_core::agent::Item::Tool(card) if card.is_delegation() => {
+                    // One run_wave call is several agents: one row per part, with
+                    // the part's own outcome once the wave reports it.
+                    let parts = wave_parts(card);
+                    if !parts.is_empty() {
+                        return parts;
+                    }
                     // The committee names its subject differently to a subagent;
                     // both read as "what was delegated" in the panel.
                     let task = card
                         .input_text(&["description", "decision", "task", "summary", "prompt"])
                         .unwrap_or_else(|| "delegated work".to_string());
-                    Some(Delegation {
+                    vec![Delegation {
                         agent: capitalize(card.title.trim()),
                         task: task.chars().take(96).collect(),
                         call_id: card.id.clone(),
                         done: card.status.done(),
-                    })
+                        failed: card.status == harness_core::agent::ToolStatus::Failed,
+                    }]
                 }
-                _ => None,
+                _ => Vec::new(),
             })
             .collect()
     }
@@ -1428,6 +1985,11 @@ impl HarnessState {
                 detail: Some(title.clone()),
                 elapsed,
             }),
+            RunState::Running if conversation.session_id.is_none() => Some(Activity {
+                headline: "starting the engine".to_string(),
+                detail: Some("the first session takes a few seconds; the prompt is sent the moment it opens".to_string()),
+                elapsed,
+            }),
             RunState::Running => {
                 if let Some(card) = conversation.items.iter().rev().find_map(|item| match item {
                     harness_core::agent::Item::Tool(card) if !card.status.done() => Some(card),
@@ -1492,34 +2054,6 @@ impl HarnessState {
         }
     }
 
-    /// Follow-up prompts that fit the current state.
-    ///
-    /// @returns prompts the conversation offers under the transcript
-    pub fn suggestions(&self) -> Vec<String> {
-        let mut prompts = Vec::new();
-        if self.models.active.is_none() {
-            prompts.push("add a model route over ⌘,".to_string());
-        }
-        if self.agent.conversation.session_id.is_none() {
-            prompts.push("start the engine and tell me what you can do".to_string());
-        }
-        if self.git.is_some() {
-            let changes = self.git_view.status.change_count();
-            if changes > 0 {
-                prompts.push(format!("review the {changes} change(s) in this repository"));
-                prompts.push("commit the current changes for me".to_string());
-            } else {
-                prompts.push("check what files are tracked in git".to_string());
-            }
-        }
-        if !self.shells.is_empty() {
-            prompts.push("summarise what the last command printed".to_string());
-        }
-        prompts.push("run the project's checks and fix what fails".to_string());
-        prompts.truncate(4);
-        prompts
-    }
-
     /// The panel's notice: when the session last moved, and what it last said.
     ///
     /// @returns the timestamp line and the body, or nothing before a session
@@ -1533,7 +2067,7 @@ impl HarnessState {
             .rev()
             .find_map(|item| match item {
                 harness_core::agent::Item::Assistant { text, .. } if !text.trim().is_empty() => {
-                    Some(prose_tail(text, 420))
+                    Some(plain_summary(text, 320))
                 }
                 _ => None,
             })
@@ -1579,6 +2113,7 @@ impl HarnessState {
     pub fn go(&mut self, pane: Pane, spot: SidebarSpot) {
         self.pane = pane;
         self.spot = spot;
+        self.record_nav();
     }
 
     /// The engine layout, when it was found.
@@ -2233,9 +2768,9 @@ impl HarnessState {
         if self.agent.client.is_some() || self.agent.starting {
             return;
         }
-        if self.models.active.is_none() {
-            return;
-        }
+        // No `.harness/models.json` route is not "no model": the composition
+        // serves its default route (AI_MODEL, or OpenRouter's DeepSeek), so the
+        // engine starts either way and the route it names is what runs.
         let paths = match self.paths() {
             Ok(paths) => paths.clone(),
             Err(err) => {
@@ -2269,8 +2804,26 @@ impl HarnessState {
     /// The composition reads the routes at launch, so a new or edited route
     /// needs a fresh process; the transcript stays, because it is the app's.
     pub fn restart_engine(&mut self) {
+        self.save_task();
+        // Keep the engine's durable context as well as the visible transcript.
+        if let Some(session) = self.agent.conversation.session_id.take() {
+            self.agent.resume = Some(session);
+        }
+        if self.agent.conversation.state.busy() {
+            self.agent
+                .conversation
+                .fail("the turn was interrupted by a model route change");
+        }
+        self.agent.live_sessions.clear();
+        self.agent.pending.clear();
+        self.agent.applied_model = None;
+        // Retired readers can still emit events while their process shuts down.
+        // A new channel prevents those events from corrupting the new session.
+        let (sender, events) = std::sync::mpsc::channel();
+        self.agent.sender = sender;
+        self.agent.events = events;
         if self.agent.client.is_some() {
-            self.agent.client = None; // dropping the client ends the process
+            self.agent.client = None;
             self.agent.conversation.notice(
                 NoticeLevel::Info,
                 "engine restarted for the new model route",
@@ -2290,31 +2843,49 @@ impl HarnessState {
             return;
         }
         self.ensure_engine();
+        let route_ready = self.apply_requested_model();
         let Some(client) = self.agent.client.as_ref() else {
             let reason = self
                 .agent
                 .start_error
                 .clone()
-                .unwrap_or_else(|| "no model route is configured".to_string());
+                .unwrap_or_else(|| "the engine could not be started".to_string());
             self.agent.conversation.fail(reason);
             return;
         };
-        let Some(session) = self.agent.conversation.session_id.clone() else {
-            // The session is opened in the background; asking again in a moment
-            // is the honest behaviour rather than dropping the prompt.
+        let Some(session) = self.agent.conversation.session_id.clone().filter(|_| route_ready) else {
+            // The session is opened in the background. The prompt is on screen
+            // and counted as asked right away; it reaches the engine the moment
+            // the session is ready (see SessionReady in the pump).
+            if self.current_task.is_none() {
+                self.current_task = Some(TaskStore::new_id());
+                self.task_created = Some(chrono::Local::now().to_rfc3339());
+            }
+            self.agent.conversation.begin_prompt(text);
             self.agent.pending_input = Some(text.to_string());
-            self.agent
-                .conversation
-                .notice(NoticeLevel::Info, "waiting for the engine session");
+            self.agent.last_prompt = Some(text.to_string());
+            self.agent.input.clear();
+            self.scroll_to_bottom = true;
+            self.pane = Pane::Conversation;
+            self.save_task();
             return;
         };
+        if self.current_task.is_none() {
+            self.current_task = Some(TaskStore::new_id());
+            self.task_created = Some(chrono::Local::now().to_rfc3339());
+        }
         self.agent.conversation.begin_prompt(text);
         client.prompt(&session, text);
+        self.task_dirty = true;
         self.agent.last_prompt = Some(text.to_string());
         self.agent.input.clear();
         self.last_activity = chrono::Local::now();
         self.spot = SidebarSpot::Task;
         self.pane = Pane::Conversation;
+        self.scroll_to_bottom = true;
+        // The task is in the history from its first prompt, not its first answer.
+        self.save_task();
+        self.record_nav();
     }
 
     /// Sends the last prompt again, after a turn failed.
@@ -2514,12 +3085,26 @@ impl HarnessState {
                 models
                     .iter()
                     .map(|model| {
+                        // The parser on save (`save_model_draft`) reads a line
+                        // positionally as `id | name | context | max`: writing
+                        // only the fields that happen to be set, in order, once
+                        // silently shifted a bare context_window (no name) into
+                        // the name slot on the very next save, and dropped
+                        // max_tokens outright (it was never written here at
+                        // all) — a route saved with only a context window
+                        // configured lost it, and quietly renamed itself to
+                        // that number, on a no-op open-then-save. Once any of
+                        // the three trailing fields is set, all three are
+                        // written (blank for the ones that are not), so a
+                        // field's position always matches what it means.
                         let mut line = model.id.clone();
-                        if let Some(name) = &model.name {
-                            line.push_str(&format!(" | {name}"));
-                        }
-                        if let Some(window) = model.context_window {
-                            line.push_str(&format!(" | {window}"));
+                        if model.name.is_some() || model.context_window.is_some() || model.max_tokens.is_some() {
+                            line.push_str(&format!(
+                                " | {} | {} | {}",
+                                model.name.as_deref().unwrap_or(""),
+                                model.context_window.map(|window| window.to_string()).unwrap_or_default(),
+                                model.max_tokens.map(|max| max.to_string()).unwrap_or_default(),
+                            ));
                         }
                         line
                     })
@@ -2601,10 +3186,13 @@ impl HarnessState {
             self.toast("a route needs a name");
             return;
         }
-        if draft.base_url.trim().is_empty() {
-            self.toast("a route needs a base URL");
-            return;
-        }
+        let base_url = match harness_core::config::validate_base_url(&draft.base_url) {
+            Ok(url) => url,
+            Err(reason) => {
+                self.toast(reason);
+                return;
+            }
+        };
         let key_var = if draft.api_key_env.trim().is_empty() {
             "AI_API_KEY"
         } else {
@@ -2666,7 +3254,7 @@ impl HarnessState {
                 draft.display_name.trim().to_string()
             }),
             api: Some("openai-completions".to_string()),
-            base_url: Some(draft.base_url.trim().to_string()),
+            base_url: Some(base_url),
             api_key_env: Some(if draft.api_key_env.trim().is_empty() {
                 "AI_API_KEY".to_string()
             } else {
@@ -2768,6 +3356,37 @@ impl HarnessState {
         self.pump_core();
         self.pump_agent();
         self.pump_search();
+        self.watch_stuck_start();
+        if self.task_dirty && self.task_saved_at.elapsed() >= TASK_SAVE_EVERY {
+            self.save_task();
+        }
+    }
+
+    /// Fails a turn that never got a session, instead of spinning forever.
+    ///
+    /// A first session commonly takes a few seconds; past this timeout, either
+    /// the engine crashed without saying so, the route can never be reached, or
+    /// the process is genuinely stuck — every one of those needs a visible
+    /// failure and a retry, which is what every other failure in this app
+    /// already offers. Without this, a turn that never gets a session spins
+    /// its activity card ("starting the engine") with no way out but quitting
+    /// the app.
+    fn watch_stuck_start(&mut self) {
+        if !self.agent.conversation.state.busy() || self.agent.conversation.session_id.is_some() {
+            return;
+        }
+        let Some(elapsed) = self.agent.conversation.prompt_elapsed() else {
+            return;
+        };
+        if elapsed < SESSION_START_TIMEOUT {
+            return;
+        }
+        self.agent.pending_input = None;
+        self.agent.conversation.fail(
+            "the engine did not open a session in time. This usually means the route in ⌘, \
+             cannot be reached, or the engine process is stuck. Try again, or restart the engine \
+             (the title's ⋯ menu, or Restart the engine).",
+        );
     }
 
     /// Adopts search results that belong to the newest request.
@@ -2821,27 +3440,43 @@ impl HarnessState {
             self.last_activity = chrono::Local::now();
         }
         for event in events {
+            // A session the window has left may still be finishing a cancelled
+            // turn; its updates belong to its own saved task, not to this one.
+            if let (Some(session), Some(current)) =
+                (event.session(), self.agent.conversation.session_id.as_deref())
+            {
+                if session != current {
+                    continue;
+                }
+            }
             match &event {
                 AgentEvent::Initialized { name, version } => {
                     log::info!("engine: {name} {version}");
-                    if let Ok(paths) = self.paths() {
-                        let workspace = self.root.to_string_lossy().into_owned();
-                        let _ = paths;
-                        if let Some(client) = self.agent.client.as_ref() {
-                            client.new_session(&workspace);
+                    let workspace = self.root.to_string_lossy().into_owned();
+                    if let Some(client) = self.agent.client.as_ref() {
+                        let mcp = self.mcp_wire();
+                        match self.agent.resume.take() {
+                            Some(session) => {
+                                client.resume_session(&session, &workspace, &mcp);
+                            }
+                            None => {
+                                client.new_session_with(&workspace, &mcp);
+                            }
                         }
                     }
                 }
                 AgentEvent::SessionReady { session_id, .. } => {
-                    self.agent.conversation.session_id = Some(session_id.clone());
-                    self.apply_requested_model();
-                    if let Some(text) = self.agent.pending_input.take() {
-                        self.agent.conversation.session_id = Some(session_id.clone());
-                        self.send_prompt(&text);
+                    self.agent.live_sessions.insert(session_id.clone());
+                    self.agent.conversation.apply(&event);
+                    if self.apply_requested_model() {
+                        self.send_pending_prompt();
                     }
                 }
                 AgentEvent::ConfigOptions { .. } => {
-                    self.apply_requested_model();
+                    self.agent.conversation.apply(&event);
+                    if self.apply_requested_model() {
+                        self.send_pending_prompt();
+                    }
                 }
                 AgentEvent::Request(AgentRequest::Permission {
                     rpc_id,
@@ -2894,9 +3529,27 @@ impl HarnessState {
                         .fail(format!("the engine exited ({code:?})"));
                     self.agent.client = None;
                 }
+                AgentEvent::RequestFailed { method, message }
+                    if method.starts_with(harness_core::acp::RESUME_METHOD) =>
+                {
+                    // The engine could not reopen the saved session (its log
+                    // was cleared, or it belongs to another checkout): the
+                    // transcript is still the app's, and the next prompt runs
+                    // in a fresh session.
+                    log::warn!("engine: {method} failed: {message}");
+                    self.agent.conversation.notice(
+                        NoticeLevel::Warn,
+                        "the engine could not reopen this task's session; the next prompt starts a fresh one",
+                    );
+                    self.agent.conversation.session_id = None;
+                    if let Some(client) = self.agent.client.as_ref() {
+                        client.new_session_with(&self.root.to_string_lossy(), &self.mcp_wire());
+                    }
+                    continue;
+                }
                 AgentEvent::RequestFailed { method, message } => {
                     log::warn!("engine: {method} failed: {message}");
-                    if method == "session/prompt" || method == "session/new" {
+                    if method == "session/prompt" || method == "session/new" || method == "session/set_config_option" {
                         // The engine's message is the provider's own error, JSON
                         // and all; the transcript gets the reason instead, and
                         // the run ends in one place rather than in two.
@@ -2905,6 +3558,8 @@ impl HarnessState {
                             self.agent.last_prompt = Some(queued);
                         }
                         self.agent.conversation.fail(text);
+                        self.task_dirty = true;
+                        self.save_task();
                         continue;
                     }
                     self.agent
@@ -2913,7 +3568,14 @@ impl HarnessState {
                 }
                 _ => {}
             }
-            self.agent.conversation.apply(&event);
+            let settled = matches!(event, AgentEvent::TurnEnded { .. } | AgentEvent::EngineExited { .. });
+            if self.agent.conversation.apply(&event) {
+                self.task_dirty = true;
+            }
+            if settled {
+                // A finished turn is the natural checkpoint: the whole answer is in.
+                self.save_task();
+            }
             if let AgentEvent::Initialized { name, version } = event {
                 self.agent.conversation.engine_name = name;
                 self.agent.conversation.engine_version = version;
@@ -2926,18 +3588,18 @@ impl HarnessState {
     /// The engine advertises its routes as opaque values; the app's registry
     /// knows which of them corresponds to the workspace's active route, so the
     /// selection is made by matching rather than by inventing a value.
-    fn apply_requested_model(&mut self) {
+    fn apply_requested_model(&mut self) -> bool {
         let Some(requested) = self.agent.requested_route.clone() else {
-            return;
+            return true;
         };
         let Some((route, model)) = requested.split_once('/') else {
-            return;
+            return false;
         };
         let Some(client) = self.agent.client.as_ref() else {
-            return;
+            return false;
         };
         let Some(session) = self.agent.conversation.session_id.clone() else {
-            return;
+            return false;
         };
 
         let advertised = self
@@ -2946,20 +3608,39 @@ impl HarnessState {
             .config_options
             .iter()
             .find(|option| option.id == "model");
-        let Some(option) = advertised else { return };
+        let Some(option) = advertised else { return false };
         let current = option.current_value.clone().unwrap_or_default();
         let matches = |choice: &ConfigChoice| choice_matches(&choice.value, route, model);
         let Some(choice) = option.choices.iter().find(|choice| matches(choice)) else {
-            // The route is not mounted in this engine — a restart is the only
-            // way to add one, and saying so beats failing silently.
-            let message = format!("the engine is not serving {requested}; restarting it");
+            // The route is not mounted in this engine. A restart is the only
+            // way to add one — the route registry is read at launch — so this
+            // used to *say* "restarting it" without ever doing so, which left
+            // the queued prompt stuck forever with no visible failure. Try the
+            // restart exactly once per requested route, then report the
+            // mismatch plainly so a route this build genuinely cannot serve
+            // does not restart in a loop.
+            if route_mismatch_action(self.agent.route_restart_attempted.as_deref(), &requested)
+                == RouteMismatch::Restart
+            {
+                self.agent.route_restart_attempted = Some(requested.clone());
+                // The stale queued text belongs to the engine being replaced;
+                // restart_engine() fails the turn (if one is running), whose
+                // "try again" resends the same text through send_prompt once
+                // the new engine's session is ready.
+                self.agent.pending_input = None;
+                self.restart_engine();
+                return false;
+            }
+            let message = format!(
+                "the engine is not serving {requested} even after a restart — check the route in ⌘, (a model id the route's api does not know reads exactly like this)"
+            );
             if self.agent.applied_model.as_deref() != Some(&message) {
                 self.agent
                     .conversation
                     .notice(NoticeLevel::Warn, message.clone());
                 self.agent.applied_model = Some(message);
             }
-            return;
+            return false;
         };
         if current == choice.value {
             self.agent.applied_model = Some(
@@ -2970,9 +3651,129 @@ impl HarnessState {
                     .map(|model| model.label.clone())
                     .unwrap_or_else(|| requested.clone()),
             );
-            return;
+            // A route that now resolves earns a fresh restart attempt if a
+            // *later* mismatch turns up (e.g. the route document changes again).
+            self.agent.route_restart_attempted = None;
+            return true;
         }
         client.set_config_option(&session, "model", &choice.value);
+        false
+    }
+
+    /// Dispatch a queued prompt only after the requested model is acknowledged.
+    fn send_pending_prompt(&mut self) {
+        if let (Some(client), Some(session)) = (
+            self.agent.client.as_ref(), self.agent.conversation.session_id.as_deref(),
+        ) {
+            if let Some(text) = self.agent.pending_input.take() {
+                client.prompt(session, &text);
+                self.task_dirty = true;
+            }
+        }
+    }
+}
+
+/// The parts of a `run_wave` call, as panel rows.
+///
+/// The call's input names every part; its result, once it arrives, reports one
+/// line per part (`[wave N] id: done — summary`), which is where each row's own
+/// outcome comes from. Any other call yields no rows.
+///
+/// @param card the delegation card
+/// @returns one row per part, or nothing when the card is not a wave
+fn wave_parts(card: &harness_core::agent::ToolCard) -> Vec<Delegation> {
+    if !card.title.trim().eq_ignore_ascii_case("run_wave") {
+        return Vec::new();
+    }
+    let Some(parts) = card
+        .input
+        .as_ref()
+        .and_then(|input| input.get("parts"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Vec::new();
+    };
+    parts
+        .iter()
+        .filter_map(|part| {
+            let id = part.get("id")?.as_str()?.to_string();
+            let task = part
+                .get("task")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("a part of the job");
+            let marker = format!("] {id}: ");
+            let outcome = card
+                .output
+                .lines()
+                .find_map(|line| line.split_once(marker.as_str()).map(|(_, rest)| rest.to_string()));
+            let failed = outcome.as_deref().is_some_and(|rest| rest.starts_with("failed"))
+                || (card.status == harness_core::agent::ToolStatus::Failed);
+            Some(Delegation {
+                agent: capitalize(&id),
+                task: one_line(task, 96),
+                call_id: card.id.clone(),
+                done: outcome.is_some() || card.status.done(),
+                failed,
+            })
+        })
+        .collect()
+}
+
+/// The files one part of a `run_wave` call owned.
+///
+/// @param card the call
+/// @param part the part's id, as its panel row names it (first letter raised)
+/// @returns the part's declared files
+fn wave_files(card: &harness_core::agent::ToolCard, part: &str) -> Vec<String> {
+    card.input
+        .as_ref()
+        .and_then(|input| input.get("parts"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| id.eq_ignore_ascii_case(part))
+        })
+        .flat_map(|entry| {
+            entry
+                .get("files")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        })
+        .filter_map(|file| file.as_str().map(str::to_string))
+        .collect()
+}
+
+/// What to do about a requested route the running engine does not advertise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteMismatch {
+    /// Restart the engine: this route has not been tried against a fresh
+    /// process yet, and the route registry is only read at launch.
+    Restart,
+    /// Report the mismatch plainly: a restart has already been tried for this
+    /// exact route and it still does not appear, so trying again would only
+    /// restart forever for a route this engine build genuinely cannot serve.
+    Report,
+}
+
+/// Decides what a mismatched route earns: one restart, then a plain report.
+///
+/// Keyed on the route string itself (not a bare flag) so a *different* route
+/// the user switches to afterward gets its own fresh attempt, and switching
+/// back to a route that already resolved does too.
+///
+/// @param attempted the route a restart was already tried for, if any
+/// @param requested the route this session wants right now
+/// @returns what this mismatch earns
+fn route_mismatch_action(attempted: Option<&str>, requested: &str) -> RouteMismatch {
+    if attempted == Some(requested) {
+        RouteMismatch::Report
+    } else {
+        RouteMismatch::Restart
     }
 }
 
@@ -3127,6 +3928,99 @@ mod tests {
     }
 
     #[test]
+    fn opening_and_resaving_a_route_with_no_edits_keeps_its_context_window_and_max_tokens() {
+        // Regression pin: a model saved with only `contextWindow` set (no
+        // `name`) had its context window silently renamed into the `name`
+        // field, and `maxTokens` was dropped outright, on a no-op
+        // open-the-dialog-then-save — because the two fields were written to
+        // the textarea positionally but only when present, so an absent
+        // `name` shifted `contextWindow` one slot to the left. Two real
+        // sessions hit exactly this: a rate-limit fix (contextWindow/maxTokens
+        // set to fit a provider's per-minute cap) silently reverted the moment
+        // the user reopened the model dialog to change something unrelated,
+        // like the API key.
+        let root = scratch("model-draft-roundtrip");
+        let harness = root.join(".harness");
+        std::fs::create_dir_all(&harness).expect("harness dir");
+        std::fs::write(
+            harness.join("models.json"),
+            r#"{"providers":{"grok":{"baseURL":"https://api.groq.com/openai/v1","apiKeyEnv":"AI_API_KEY","models":[{"id":"qwen/qwen3.8-27b","contextWindow":5000,"maxTokens":1200}]}},"active":{"provider":"grok","model":"qwen/qwen3.8-27b"}}"#,
+        )
+        .expect("models document");
+        let mut state = HarnessState::new(root.clone(), None);
+        let draft = state.model_draft_for("grok");
+        assert_eq!(
+            draft.models, "qwen/qwen3.8-27b |  | 5000 | 1200",
+            "the draft must carry both numbers forward, in their own fields, not shift them into name"
+        );
+        // Re-saving the unedited draft (what happens when a user opens the
+        // dialog only to paste a new API key) must not lose either field.
+        state.save_model_draft(&draft);
+        let saved = state.models.providers.get("grok").expect("route still exists");
+        let model = &saved.models.as_ref().expect("models kept")[0];
+        assert_eq!(model.name, None, "no name was ever set; the round trip must not invent one");
+        assert_eq!(model.context_window, Some(5000));
+        assert_eq!(model.max_tokens, Some(1200));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn daily_quota_invalid_endpoint_and_stream_failures_have_distinct_repairs() {
+        let daily = describe_failure(r#"429: {"message":"Rate limit exceeded: free-models-per-day","metadata":{"headers":{"X-RateLimit-Reset":"1790467200000"}}}"#);
+        assert!(daily.contains("daily free-model quota"));
+        assert!(daily.contains("2026-09-27 00:00 UTC"));
+        assert!(!daily.contains("Try again in a moment"));
+        assert!(describe_failure("Invalid URL").contains("complete API base URL"));
+        assert!(describe_failure("Provider finish_reason: error").contains("supplied no further detail"));
+    }
+
+    #[test]
+    fn route_restart_keeps_context_and_discards_retired_engine_events() {
+        let root = scratch("route-restart");
+        let mut state = HarnessState::new(root.clone(), None);
+        // Prevent launching an actual engine in this state regression.
+        state.agent.starting = true;
+        state.agent.conversation.begin_prompt("Remember the original task");
+        state.agent.conversation.session_id = Some("durable-session".into());
+        state.agent.live_sessions.insert("durable-session".into());
+        let retired = state.agent.sender.clone();
+        state.restart_engine();
+        assert_eq!(state.agent.resume.as_deref(), Some("durable-session"));
+        assert!(state.agent.conversation.session_id.is_none());
+        assert!(!state.agent.conversation.state.busy());
+        assert!(state.agent.live_sessions.is_empty());
+        assert!(retired.send(AgentEvent::EngineExited { code: Some(0) }).is_err());
+        assert_eq!(state.agent.conversation.first_prompt(), Some("Remember the original task"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_mismatched_route_earns_exactly_one_restart_then_a_plain_report() {
+        // This is the bug behind a turn that spins on "starting the engine"
+        // forever: the route-mismatch branch used to *say* "restarting it"
+        // without calling anything, so a route the freshly-launched engine
+        // never advertised (a typo'd model id, a route document written after
+        // the engine already started) queued a prompt that was never sent and
+        // never failed either — nothing told the user it was stuck.
+        assert_eq!(
+            route_mismatch_action(None, "deepseek/deepseek-chat"),
+            RouteMismatch::Restart,
+            "the first mismatch for a route always restarts"
+        );
+        assert_eq!(
+            route_mismatch_action(Some("deepseek/deepseek-chat"), "deepseek/deepseek-chat"),
+            RouteMismatch::Report,
+            "a second mismatch for the SAME route must not restart again — a route this engine \
+             build genuinely cannot serve would otherwise restart forever with no visible failure"
+        );
+        assert_eq!(
+            route_mismatch_action(Some("deepseek/deepseek-chat"), "qwen/qwen3.7-plus"),
+            RouteMismatch::Restart,
+            "switching to a DIFFERENT route earns its own fresh attempt"
+        );
+    }
+
+    #[test]
     fn a_provider_error_becomes_a_sentence_with_the_way_out() {
         // Verbatim from the run that reported it: a free OpenRouter route whose
         // shared pool was exhausted. The transcript must not show this JSON.
@@ -3163,6 +4057,64 @@ mod tests {
         let unknown = describe_failure(&format!("boom {}", "x".repeat(500)));
         assert!(unknown.starts_with("the turn failed"), "{unknown}");
         assert!(unknown.chars().count() < 260, "kept short: {}", unknown.len());
+    }
+
+    #[test]
+    fn a_task_is_kept_reopened_whole_and_reachable_by_back_and_forward() {
+        let root = scratch("history");
+        let mut state = HarnessState::new(root.clone(), None);
+        // No engine process in a unit test: the resume is recorded, not sent.
+        state.paths = Err("no engine in unit tests".to_string());
+        assert!(state.tasks.is_empty(), "a new workspace has no history");
+
+        // Nothing asked is not history.
+        state.save_task();
+        assert!(state.tasks.is_empty());
+
+        state.agent.conversation.begin_prompt("Build a todo CLI with tests");
+        state.agent.conversation.session_id = Some("session-one".to_string());
+        state.agent.conversation.notice(NoticeLevel::Info, "answered");
+        // The turn finished; a running one would be stopped (and say so) on leaving.
+        state.agent.conversation.state = RunState::Idle;
+        state.current_task = Some(TaskStore::new_id());
+        state.save_task();
+        assert_eq!(state.tasks.len(), 1);
+        assert_eq!(state.tasks[0].title, "Build a todo CLI with tests");
+        let first = state.current_task.clone().expect("the task has an id");
+
+        // A new task keeps the old one in the history, and starts empty.
+        state.new_task();
+        assert!(state.current_task.is_none());
+        assert!(state.agent.conversation.items.is_empty());
+        assert_eq!(state.tasks.len(), 1, "the first task survived the new one");
+
+        // Reopening restores the transcript and remembers the engine session,
+        // which the engine is asked to resume once it is up.
+        state.open_task(&first);
+        assert_eq!(state.current_task.as_deref(), Some(first.as_str()));
+        assert_eq!(state.agent.conversation.items.len(), 2);
+        assert_eq!(state.agent.resume.as_deref(), Some("session-one"));
+        assert_eq!(
+            state.agent.last_prompt.as_deref(),
+            Some("Build a todo CLI with tests"),
+            "try again asks the reopened task's own last prompt"
+        );
+
+        // Back returns to the new task; forward returns to the reopened one.
+        assert!(state.can_go_back());
+        state.navigate(false);
+        assert!(state.current_task.is_none() || state.current_task.as_deref() != Some(first.as_str()));
+        state.navigate(true);
+        assert_eq!(state.current_task.as_deref(), Some(first.as_str()));
+
+        // Rename sticks through later saves; delete removes it from the history.
+        state.rename_task(&first, "Todo CLI");
+        state.save_task();
+        assert_eq!(state.tasks[0].title, "Todo CLI");
+        assert_eq!(state.session_title(), "Todo CLI");
+        state.delete_task(&first);
+        assert!(state.tasks.is_empty());
+        assert!(state.current_task.is_none());
     }
 
     #[test]

@@ -43,6 +43,19 @@ const CHANGE_LINES_OPEN: usize = 40;
 /// How many lines of a delegation's answer ride on the closed card.
 const AGENT_RESULT_LINES: usize = 3;
 
+/// How many lines of a wave's result ride on its closed card: one per part.
+const WAVE_RESULT_LINES: usize = 14;
+
+/// The widest the transcript's reading column gets, in points: past this, lines
+/// are too long to read comfortably, so a wide window centres the column.
+const READING_COLUMN: f32 = 880.0;
+
+/// Code blocks longer than this many lines fold, with a "show all" to open them.
+const CODE_FOLD_LINES: usize = 24;
+
+/// The most lines an opened code block draws; the copy button carries the rest.
+const CODE_MAX_LINES: usize = 600;
+
 /// Draws the conversation view inside the card's body.
 ///
 /// @param state the application state
@@ -53,17 +66,6 @@ pub fn show(state: &mut HarnessState, ui: &mut Ui, area: Rect) {
     let left = area.left() + inset;
     let right = area.right() - inset;
 
-    let busy = state.agent.conversation.state.busy();
-    let suggestions = if busy {
-        Vec::new()
-    } else {
-        state.suggestions()
-    };
-    let suggestion_height = if suggestions.is_empty() {
-        0.0
-    } else {
-        suggestions.len() as f32 * 32.0 + 10.0
-    };
     let ask_height = if state.agent.pending.is_empty() {
         0.0
     } else {
@@ -76,14 +78,10 @@ pub fn show(state: &mut HarnessState, ui: &mut Ui, area: Rect) {
         egui::pos2(left, bottom - composer_height),
         egui::pos2(right, bottom),
     );
-    let composer_top = composer.top() - 16.0;
-    let suggestions_rect = Rect::from_min_max(
-        egui::pos2(left, composer_top - suggestion_height + 8.0),
-        egui::pos2(right, composer_top - 6.0),
-    );
+    let composer_top = composer.top() - 10.0;
     let asks_rect = Rect::from_min_max(
-        egui::pos2(left, suggestions_rect.top() - ask_height),
-        egui::pos2(right, suggestions_rect.top() - 4.0),
+        egui::pos2(left, composer_top - ask_height),
+        egui::pos2(right, composer_top - 4.0),
     );
     let transcript = Rect::from_min_max(
         egui::pos2(left, area.top() + 6.0),
@@ -94,21 +92,31 @@ pub fn show(state: &mut HarnessState, ui: &mut Ui, area: Rect) {
     if !state.agent.pending.is_empty() {
         asks(state, ui, asks_rect);
     }
-    if !suggestions.is_empty() {
-        suggestions_view(state, ui, suggestions_rect, &suggestions);
-    }
     composer_view(state, ui, composer);
 }
 
 /// The scrolling record itself.
 ///
+/// The record is a reading column: capped at a comfortable line length and
+/// centred in wide windows, full width in narrow ones. It sticks to the newest
+/// line while the reader is there, and offers a way back down when they have
+/// scrolled up to read.
+///
 /// @param state the application state
 /// @param ui the interface to draw into
 /// @param rect the rectangle the transcript owns
 fn transcript_view(state: &mut HarnessState, ui: &mut Ui, rect: Rect) {
+    let column = rect.width().min(READING_COLUMN);
+    let content = Rect::from_min_max(
+        egui::pos2(rect.center().x - column / 2.0, rect.top()),
+        egui::pos2(rect.center().x + column / 2.0, rect.bottom()),
+    );
+    // The markdown cache is taken out for the frame so the transcript can be
+    // read while the cache is written.
+    let mut markdown = std::mem::take(&mut state.markdown);
+    let jump = std::mem::take(&mut state.scroll_to_bottom);
     let conversation = &state.agent.conversation;
     let skipped = conversation.items.len().saturating_sub(TRANSCRIPT_ITEMS);
-    let font = theme::mono(state.config.terminal_font_size - 1.0);
     let reveal = state.reveal_call.clone();
     let plan: Vec<(String, String)> = conversation
         .plan
@@ -116,6 +124,7 @@ fn transcript_view(state: &mut HarnessState, ui: &mut Ui, rect: Rect) {
         .map(|entry| (entry.content.clone(), entry.status.clone()))
         .collect();
     let todos = current_todos(&conversation.items);
+    let running = conversation.state.busy();
 
     let mut toggle_thinking: Option<usize> = None;
     let mut reply: Option<String> = None;
@@ -125,110 +134,158 @@ fn transcript_view(state: &mut HarnessState, ui: &mut Ui, rect: Rect) {
     let mut scrolled = false;
     let mut retry_last = false;
     let mut open_models = false;
+    let mut suggestion: Option<String> = None;
+    let mut open_file: Option<String> = None;
     let activity = state.activity();
-    let failed = matches!(
-        state.agent.conversation.state,
-        harness_core::agent::RunState::Failed { .. }
-    );
+    let failure = match &state.agent.conversation.state {
+        harness_core::agent::RunState::Failed { message } => Some(message.clone()),
+        _ => None,
+    };
     let can_retry = state.agent.last_prompt.is_some();
     let model = crate::shell::model_label(state);
+    let welcome = welcome_lines(state);
 
-    theme::inside(ui, rect, |ui| {
-        egui::ScrollArea::vertical()
+    let output = theme::inside(ui, content, |ui| {
+        let mut area = egui::ScrollArea::vertical()
             .id_salt("transcript")
             .auto_shrink([false, false])
-            .stick_to_bottom(true)
-            .show(ui, |ui| {
-                if conversation.items.is_empty() {
-                    empty(ui, state, rect.width());
+            .stick_to_bottom(true);
+        if jump {
+            area = area.vertical_scroll_offset(f32::MAX);
+        }
+        area.show(ui, |ui| {
+            ui.set_width((ui.available_width().min(column) - 12.0).max(1.0));
+            // Horizontal notice rows must not enlarge every subsequent card.
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            ui.add_space(12.0);
+            if conversation.items.is_empty() {
+                if let Some(prompt) = empty(ui, &welcome) {
+                    suggestion = Some(prompt);
                 }
-                if skipped > 0 {
-                    ui.label(
-                        RichText::new(format!(
-                            "… {skipped} earlier item(s) not drawn; the transcript file has all of them"
-                        ))
-                        .size(11.5)
-                        .color(theme::FAINT),
-                    );
-                    ui.add_space(6.0);
-                }
-                // The prompt the last answer was given, for its retry action.
-                let mut asked: Option<String> = None;
-                for (index, item) in conversation.items[skipped..].iter().enumerate() {
-                    match item {
-                        Item::User { text, .. } => {
-                            asked = Some(text.clone());
-                            user_bubble(ui, rect.width(), text);
+            }
+            if skipped > 0 {
+                ui.label(
+                    RichText::new(format!(
+                        "… {skipped} earlier item(s) not drawn; the exported transcript has all of them"
+                    ))
+                    .size(11.5)
+                    .color(theme::FAINT),
+                );
+                ui.add_space(6.0);
+            }
+            // The prompt the last answer was given, for its retry action.
+            let mut asked: Option<String> = None;
+            let last = conversation.items.len().saturating_sub(1);
+            for (index, item) in conversation.items[skipped..].iter().enumerate() {
+                let absolute = skipped + index;
+                match item {
+                    Item::User { text, .. } => {
+                        asked = Some(text.clone());
+                        user_bubble(ui, text);
+                    }
+                    Item::Assistant { id, text, thinking, thinking_open, rating } => {
+                        let streaming = running && absolute == last;
+                        if !thinking.is_empty()
+                            && thinking_view(ui, thinking, *thinking_open, streaming && text.trim().is_empty())
+                        {
+                            toggle_thinking = Some(absolute);
                         }
-                        Item::Assistant { id, text, thinking, thinking_open, rating } => {
-                            if !thinking.is_empty() && thinking_view(ui, thinking, *thinking_open) {
-                                toggle_thinking = Some(skipped + index);
-                            }
-                            prose(ui, text, &font);
-                            if !text.trim().is_empty() {
-                                if let Some(action) = message_actions(ui, text, *rating, asked.is_some()) {
-                                    match action {
-                                        MessageAction::Quote(quote) => reply = Some(quote),
-                                        MessageAction::Retry => retry = asked.clone(),
-                                        MessageAction::Rate(value) => rated = Some((id.clone(), value)),
-                                        MessageAction::Export => export = true,
-                                    }
+                        answer(ui, &mut markdown, text, absolute);
+                        if !text.trim().is_empty() && !streaming {
+                            if let Some(action) = message_actions(ui, text, *rating, asked.is_some()) {
+                                match action {
+                                    MessageAction::Quote(quote) => reply = Some(quote),
+                                    MessageAction::Retry => retry = asked.clone(),
+                                    MessageAction::Rate(value) => rated = Some((id.clone(), value)),
+                                    MessageAction::Export => export = true,
                                 }
                             }
                         }
-                        Item::Tool(card) => {
-                            if card.is_delegation() {
-                                agent_card(ui, card, reveal.as_deref());
-                            } else if let Some(change) = card.change().filter(|change| {
-                                !change.path.is_empty() || !change.removed.is_empty() || !change.added.is_empty()
-                            }) {
-                                change_card(ui, card, &change, reveal.as_deref());
-                            } else if card.is_todo_write() && !card.todos().is_empty() {
-                                // Nothing drawn here: the live card at the end of
-                                // the transcript is the newest list, and one card
-                                // that updates is the readable shape of a list
-                                // the engine replaces whole.
-                            } else {
-                                tool_row(ui, card, reveal.as_deref());
+                    }
+                    Item::Tool(card) => {
+                        if card.is_delegation() {
+                            agent_card(ui, card, reveal.as_deref());
+                        } else if let Some(change) = card.change().filter(|change| {
+                            !change.path.is_empty() || !change.removed.is_empty() || !change.added.is_empty()
+                        }) {
+                            if change_card(ui, card, &change, reveal.as_deref()) {
+                                open_file = Some(change.path.clone());
                             }
+                        } else if card.is_todo_write() && !card.todos().is_empty() {
+                            // Nothing drawn here: the live card at the end of
+                            // the transcript is the newest list, and one card
+                            // that updates is the readable shape of a list
+                            // the engine replaces whole.
+                        } else {
+                            tool_row(ui, card, reveal.as_deref());
                         }
-                        Item::Notice { level, text } => notice(ui, *level, text),
                     }
-                    ui.add_space(8.0);
-                }
-                if !todos.is_empty() {
-                    todo_card(ui, &todos);
-                    ui.add_space(8.0);
-                }
-                if !plan.is_empty() {
-                    plan_card(ui, &plan);
-                    ui.add_space(8.0);
-                }
-                // The live row: what the engine is doing, right now, at the end
-                // of the record. A turn can run for minutes, and a transcript
-                // that stops at the last finished thing reads as a stall.
-                if let Some(activity) = &activity {
-                    working_row(ui, activity);
-                }
-                // A turn that failed is over, so the record ends with the way
-                // out rather than with a spinner.
-                if failed {
-                    match failed_row(ui, can_retry, &model) {
-                        Some(FailedAction::Retry) => retry_last = true,
-                        Some(FailedAction::Route) => open_models = true,
-                        None => {}
+                    // The failure's own notice is what the failure row at the
+                    // end already says; drawing both says it twice.
+                    Item::Notice { level: NoticeLevel::Error, text } if failure.as_deref() == Some(text.as_str()) => {
+                        continue;
                     }
+                    Item::Notice { level, text } => notice(ui, *level, text),
                 }
-                if let Some(call) = &reveal {
-                    // The panel asked for this card: show it, and bring it in.
-                    if conversation.items.iter().any(|item| matches!(item, Item::Tool(card) if &card.id == call)) {
-                        let focus = ui.min_rect();
-                        ui.scroll_to_rect(focus, Some(Align::BOTTOM));
-                        scrolled = true;
-                    }
+                ui.add_space(10.0);
+            }
+            if !todos.is_empty() {
+                todo_card(ui, &todos);
+                ui.add_space(8.0);
+            }
+            if !plan.is_empty() {
+                plan_card(ui, &plan);
+                ui.add_space(8.0);
+            }
+            // The live row: what the engine is doing, right now, at the end
+            // of the record. A turn can run for minutes, and a transcript
+            // that stops at the last finished thing reads as a stall.
+            if let Some(activity) = &activity {
+                working_row(ui, activity);
+            }
+            // A turn that failed is over, so the record ends with the reason
+            // and the way out rather than with a spinner.
+            if let Some(message) = &failure {
+                match failed_row(ui, message, can_retry, &model) {
+                    Some(FailedAction::Retry) => retry_last = true,
+                    Some(FailedAction::Route) => open_models = true,
+                    None => {}
                 }
-            });
+            }
+            if let Some(call) = &reveal {
+                // The panel asked for this card: show it, and bring it in.
+                if conversation.items.iter().any(|item| matches!(item, Item::Tool(card) if &card.id == call)) {
+                    let focus = ui.min_rect();
+                    ui.scroll_to_rect(focus, Some(Align::BOTTOM));
+                    scrolled = true;
+                }
+            }
+            ui.add_space(8.0);
+        })
     });
+    state.markdown = markdown;
+
+    // Scrolled up to read: a round button brings the newest line back.
+    let below = output.content_size.y - output.state.offset.y - output.inner_rect.height();
+    if below > 160.0 {
+        let button = Rect::from_center_size(
+            egui::pos2(rect.center().x, rect.bottom() - 22.0),
+            Vec2::splat(32.0),
+        );
+        let response = ui.interact(button, ui.id().with("jump-to-latest"), Sense::click());
+        let painter = ui.painter();
+        painter.add(theme::card_shadow().as_shape(button, CornerRadius::same(16)));
+        painter.circle_filled(button.center(), 16.0, theme::PANEL);
+        painter.circle_stroke(
+            button.center(),
+            16.0,
+            Stroke::new(1.0, if response.hovered() { theme::BORDER_STRONG } else { theme::BORDER }),
+        );
+        icons::paint(ui, Icon::ArrowDown, button.shrink(9.0), theme::DIM);
+        if response.on_hover_text("jump to the latest").clicked() {
+            state.scroll_to_bottom = true;
+        }
+    }
 
     if let Some(index) = toggle_thinking {
         if let Some(Item::Assistant { thinking_open, .. }) =
@@ -268,6 +325,19 @@ fn transcript_view(state: &mut HarnessState, ui: &mut Ui, rect: Rect) {
     if scrolled {
         state.reveal_call = None;
     }
+    if let Some(prompt) = suggestion {
+        state.agent.input = prompt;
+        state.focus = Some(FocusRequest::Agent);
+    }
+    if let Some(path) = open_file {
+        let path = if std::path::Path::new(&path).is_absolute() {
+            std::path::PathBuf::from(path)
+        } else {
+            state.root.join(path)
+        };
+        state.open_file(&path);
+        state.go(crate::state::Pane::Editor, crate::state::SidebarSpot::Task);
+    }
 }
 
 /// The engine's current task list: the input of the last `todo_write` call.
@@ -290,31 +360,6 @@ fn current_todos(items: &[Item]) -> Vec<(String, String)> {
             _ => None,
         })
         .unwrap_or_default()
-}
-
-/// The follow-up prompts under the transcript.
-///
-/// @param state the application state
-/// @param ui the interface to draw into
-/// @param rect the rectangle the follow-ups own
-/// @param suggestions the prompts to offer
-fn suggestions_view(state: &mut HarnessState, ui: &mut Ui, rect: Rect, suggestions: &[String]) {
-    theme::inside(ui, rect, |ui| {
-        for prompt in suggestions {
-            let row = theme::list_row(ui, false, false, |ui| {
-                ui.add_space(6.0);
-                icons::icon(ui, Icon::Reply, theme::FAINT, 15.0);
-                ui.add_space(10.0);
-                ui.add(
-                    egui::Label::new(RichText::new(prompt).size(13.0).color(theme::DIM)).truncate(),
-                );
-            });
-            if row.clicked() {
-                state.agent.input = prompt.clone();
-                state.focus = Some(FocusRequest::Agent);
-            }
-        }
-    });
 }
 
 /// The permission asks the engine is waiting on.
@@ -443,12 +488,10 @@ fn composer_view(state: &mut HarnessState, ui: &mut Ui, rect: Rect) {
     }
 
     let rows = 2;
-    let hint = if state.models.active.is_some() {
-        "Ask for a change, attach a command's output, or describe what to build"
-    } else {
-        "Add a model route first — over ⌘, — the engine has nothing to run on"
-    };
+    let hint = "Ask for a change, attach a command's output, or describe what to build";
     let mut send = false;
+    let mut stop = false;
+    let mut chosen_route: Option<(String, String)> = None;
     let mut open_models = false;
     let mut toggle_auto = false;
     let mut attach_last = false;
@@ -510,6 +553,9 @@ fn composer_view(state: &mut HarnessState, ui: &mut Ui, rect: Rect) {
             const SEND: f32 = 30.0;
             const MIC: f32 = 26.0;
             const CHIP: f32 = 20.0;
+            // The reference's send disc is green, not the accent blue.
+            const SEND_FILL: egui::Color32 = egui::Color32::from_rgb(0x2F, 0x7D, 0x55);
+            const SEND_HOVER: egui::Color32 = egui::Color32::from_rgb(0x25, 0x66, 0x45);
             const CHEVRON: f32 = 12.0;
             const LEFT_MARKS: f32 = 26.0 * 3.0 + GAP * 2.0; // plus, clip, play
             const RIGHT_MARKS: f32 = SEND + GAP + MIC + GAP + CHIP;
@@ -555,8 +601,11 @@ fn composer_view(state: &mut HarnessState, ui: &mut Ui, rect: Rect) {
                             .truncate(),
                         )
                         .on_hover_text("answer permission asks with their narrowest allow option");
-                    icons::icon(ui, Icon::Chevron, theme::FAINT, 12.0);
-                    clicked |= label.clicked();
+                    // The chevron is part of the control: a mark drawn beside a
+                    // clickable label that did nothing when clicked read as broken.
+                    let chevron = icons::icon(ui, Icon::Chevron, theme::FAINT, 12.0)
+                        .interact(Sense::click());
+                    clicked |= label.clicked() || chevron.clicked();
                 } else {
                     play.on_hover_text("auto approve is off");
                 }
@@ -568,35 +617,45 @@ fn composer_view(state: &mut HarnessState, ui: &mut Ui, rect: Rect) {
                 ui.spacing_mut().item_spacing.x = GAP;
                 let can_send = !state.agent.input.trim().is_empty();
                 let busy = state.agent.conversation.state.busy();
-                let size = Vec2::splat(30.0);
-                let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+                let (rect, response) = ui.allocate_exact_size(Vec2::splat(SEND), Sense::click());
                 let painter = ui.painter();
-                // The send mark keeps its dark disc whether or not there is
-                // anything to send — where it is does not move — and only
-                // lightens when it has nothing to carry.
-                let fill = if response.hovered() && can_send {
-                    theme::ACCENT
-                } else if can_send {
-                    theme::TEXT
+                if busy && !can_send {
+                    // While a turn runs and nothing new is typed, the button is
+                    // the way to stop it — in the same place the send was.
+                    let fill = if response.hovered() { theme::RED } else { theme::TEXT };
+                    painter.rect_filled(rect, CornerRadius::same(9), fill);
+                    icons::paint(ui, Icon::Stop, rect.shrink(8.0), theme::PANEL);
+                    if response.on_hover_text("stop the turn").clicked() {
+                        stop = true;
+                    }
                 } else {
-                    theme::TEXT.gamma_multiply(0.45)
-                };
-                painter.rect_filled(rect, CornerRadius::same(9), fill);
-                icons::paint(ui, Icon::ArrowUp, rect.shrink(8.0), theme::PANEL);
-                if response
-                    .on_hover_text(if !can_send {
-                        "write a prompt first"
-                    } else if busy {
-                        "queue this prompt — the engine is working"
+                    // The send mark keeps its disc whether or not there is
+                    // anything to send — where it is does not move — and only
+                    // lightens when it has nothing to carry.
+                    let fill = if response.hovered() && can_send {
+                        SEND_HOVER
+                    } else if can_send {
+                        SEND_FILL
                     } else {
-                        "send ⌘↩"
-                    })
-                    .clicked()
-                    && can_send
-                {
-                    send = true;
+                        SEND_FILL.gamma_multiply(0.35)
+                    };
+                    painter.rect_filled(rect, CornerRadius::same(9), fill);
+                    icons::paint(ui, Icon::ArrowUp, rect.shrink(8.0), theme::PANEL);
+                    if response
+                        .on_hover_text(if !can_send {
+                            "write a prompt first"
+                        } else if busy {
+                            "queue this prompt — the engine is working"
+                        } else {
+                            "send ⌘↩"
+                        })
+                        .clicked()
+                        && can_send
+                    {
+                        send = true;
+                    }
                 }
-                let mic = icons::button(ui, Icon::Mic, theme::FAINT, 26.0, theme::HOVER_SOFT);
+                let mic = icons::button(ui, Icon::Mic, theme::FAINT, MIC, theme::HOVER_SOFT);
                 if mic
                     .on_hover_text("dictation belongs to the platform: press fn twice and talk")
                     .clicked()
@@ -604,47 +663,82 @@ fn composer_view(state: &mut HarnessState, ui: &mut Ui, rect: Rect) {
                     state
                         .toast("dictation is the Mac's — press fn twice, then talk into any field");
                 }
+                // The model chip: the route this task runs on, and a menu of the
+                // others. Choosing one restarts the engine on it.
                 let model = state
                     .agent
                     .applied_model
                     .clone()
                     .or_else(|| state.active_route.clone())
-                    .unwrap_or_else(|| "no model configured".to_string());
-                // Sized rather than merely truncated: a label in a right-to-left
-                // layout sizes to its text, so an unbounded name would push the
-                // whole group left past the seam. The scope keeps the name in
-                // its budget while still letting the text be as wide as it is,
-                // so the mark and the name stay next to each other.
-                let mut named = false;
-                let mut chevron = None;
+                    .unwrap_or_else(|| "Default route".to_string());
+                let label = if show_name { shorten(&model, 28) } else { String::new() };
+                let galley = ui.painter().layout_no_wrap(
+                    label.clone(),
+                    egui::FontId::proportional(12.5),
+                    theme::TEXT,
+                );
+                let text_width = if show_name { galley.size().x.min(name_budget) } else { 0.0 };
+                let chip_width = CHIP + 8.0 + text_width + if show_name { 6.0 + CHEVRON + 8.0 } else { 4.0 };
+                let (chip, chip_response) =
+                    ui.allocate_exact_size(Vec2::new(chip_width, 26.0), Sense::click());
+                if chip_response.hovered() {
+                    ui.painter()
+                        .rect_filled(chip, CornerRadius::same(7), theme::HOVER_SOFT);
+                }
+                let tile = Rect::from_min_size(egui::pos2(chip.left() + 4.0, chip.center().y - CHIP / 2.0), Vec2::splat(CHIP));
+                ui.painter().rect_filled(tile, CornerRadius::same(6), theme::ACCENT_DIM);
+                icons::paint(ui, Icon::Harness, tile.shrink(4.0), theme::ACCENT);
                 if show_name {
-                    chevron = Some(icons::icon(ui, Icon::Chevron, theme::FAINT, 12.0));
-                    let name = ui
-                        .scope(|ui| {
-                            ui.set_max_width(name_budget);
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(shorten(&model, 30))
-                                        .size(12.5)
-                                        .color(theme::TEXT)
-                                        .strong(),
-                                )
-                                .sense(Sense::click())
-                                .truncate(),
-                            )
-                        })
-                        .inner
-                        .on_hover_text("model route — click to change");
-                    named = name.clicked();
+                    let clip = Rect::from_min_size(
+                        egui::pos2(tile.right() + 6.0, chip.top()),
+                        Vec2::new(text_width, chip.height()),
+                    );
+                    ui.painter().with_clip_rect(clip).galley(
+                        egui::pos2(clip.left(), chip.center().y - galley.size().y / 2.0),
+                        galley,
+                        theme::TEXT,
+                    );
+                    icons::paint(
+                        ui,
+                        Icon::Chevron,
+                        Rect::from_center_size(egui::pos2(chip.right() - 10.0, chip.center().y), Vec2::splat(CHEVRON)),
+                        theme::FAINT,
+                    );
                 }
-                let tile =
-                    icons::tile(ui, Icon::Harness, theme::ACCENT, 20.0, theme::ACCENT_DIM, 6);
-                let tile = tile
-                    .on_hover_text(format!("model route: {model} — click to change the route"))
-                    .interact(Sense::click());
-                if named || tile.clicked() || chevron.is_some_and(|chevron| chevron.clicked()) {
-                    open_models = true;
-                }
+                let chip_response = chip_response.on_hover_text(format!("{model} — choose the model"));
+                egui::Popup::menu(&chip_response).show(|ui| {
+                    ui.set_min_width(260.0);
+                    ui.label(RichText::new("Model").size(11.5).color(theme::FAINT));
+                    let active = state.active_route.clone();
+                    let mut any = false;
+                    for (route, profile) in &state.models.providers {
+                        for entry in profile.models.iter().flatten() {
+                            any = true;
+                            let key = format!("{route}/{}", entry.id);
+                            let label = format!(
+                                "{} · {}",
+                                entry.name.clone().unwrap_or_else(|| entry.id.clone()),
+                                profile.display_name.clone().unwrap_or_else(|| route.clone())
+                            );
+                            if ui.selectable_label(active.as_deref() == Some(key.as_str()), label).clicked() {
+                                chosen_route = Some((route.clone(), entry.id.clone()));
+                                ui.close();
+                            }
+                        }
+                    }
+                    if !any {
+                        ui.label(
+                            RichText::new("the default route: AI_MODEL in .env, or OpenRouter's DeepSeek")
+                                .size(12.0)
+                                .color(theme::DIM),
+                        );
+                    }
+                    ui.separator();
+                    if ui.button("Models and routes…  ⌘,").clicked() {
+                        open_models = true;
+                        ui.close();
+                    }
+                });
             });
         });
     });
@@ -677,82 +771,128 @@ fn composer_view(state: &mut HarnessState, ui: &mut Ui, rect: Rect) {
     if open_models {
         state.open_model_dialog();
     }
+    if stop {
+        state.stop_turn();
+    }
+    if let Some((route, model)) = chosen_route {
+        state.activate_route(&route, &model);
+    }
 }
 
-/// The empty state: what is missing, and the one click that fixes it.
+/// What the welcome screen says: a headline, what the agent will run on, and
+/// starter prompts that fit this workspace.
+struct Welcome {
+    /// What the engine will run on, or why it cannot start.
+    route: String,
+    /// Why the engine could not start, when it could not.
+    error: Option<String>,
+    /// Prompts worth one click.
+    starters: Vec<String>,
+}
+
+/// Gathers what the welcome screen shows.
 ///
-/// @param ui the interface to draw into
 /// @param state the application state
-/// @param width the transcript's width
-fn empty(ui: &mut Ui, state: &HarnessState, width: f32) {
-    ui.add_space(30.0);
-    let missing_model = state.models.active.is_none();
-    let (headline, lines): (&str, [&str; 2]) = if missing_model {
-        (
-            "no model route yet",
-            [
-                "a route is a provider, a base URL, and the models it serves",
-                "the key is read from the environment; nothing is bundled here",
-            ],
-        )
-    } else if state.agent.start_error.is_some() {
-        (
-            "the engine did not start",
-            [
-                "set the route in .harness/models.json, then press restart",
-                "the model editor opens over ⌘,",
-            ],
-        )
-    } else {
-        (
-            "nothing asked yet",
-            [
-                "type below, and every tool call the engine makes appears here",
-                "the panel on the right lists what it delegates and runs",
-            ],
-        )
-    };
-    theme::inside(
-        ui,
-        Rect::from_min_size(ui.cursor().min, Vec2::new(width, 160.0)),
-        |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(20.0);
-                ui.label(RichText::new(headline).size(14.0).color(theme::DIM));
-                ui.add_space(6.0);
-                for line in lines {
-                    ui.label(RichText::new(line).size(12.5).color(theme::FAINT));
-                }
-                if let Some(error) = &state.agent.start_error {
-                    ui.add_space(8.0);
-                    ui.label(
-                        RichText::new(shorten(error, 140))
-                            .size(12.0)
-                            .color(theme::RED),
-                    );
-                }
-            });
-        },
-    );
+/// @returns the welcome content
+fn welcome_lines(state: &HarnessState) -> Welcome {
+    let route = state
+        .agent
+        .applied_model
+        .clone()
+        .or_else(|| state.active_route.clone())
+        .map(|route| format!("runs on {route}"))
+        .unwrap_or_else(|| "runs on the default route — AI_MODEL in .env picks another".to_string());
+    let mut starters = vec![
+        "Explain how this project is organised and how to run it".to_string(),
+        "Run the tests and fix whatever fails".to_string(),
+        "Build a small feature: describe it, and I will plan, build and verify it".to_string(),
+    ];
+    if state.git.is_some() {
+        starters.push("Review the uncommitted changes and point out problems".to_string());
+    }
+    Welcome {
+        route,
+        error: state.agent.start_error.clone(),
+        starters,
+    }
 }
 
-/// A message the user sent.
+/// The welcome screen of a task nothing has been asked in yet.
 ///
 /// @param ui the interface to draw into
-/// @param width the transcript's width
-/// @param text the message
-fn user_bubble(ui: &mut Ui, width: f32, text: &str) {
-    let bubble_width = (width * 0.72).min(width - 40.0);
-    ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-        egui::Frame::new()
-            .fill(theme::ELEVATED)
-            .corner_radius(CornerRadius::same(theme::CARD_RADIUS))
-            .inner_margin(egui::Margin::symmetric(14, 10))
-            .show(ui, |ui| {
-                ui.set_max_width(bubble_width);
-                ui.label(RichText::new(text).size(13.5).color(theme::TEXT));
-            });
+/// @param welcome what it says
+/// @returns a starter prompt that was clicked, if any
+fn empty(ui: &mut Ui, welcome: &Welcome) -> Option<String> {
+    let mut chosen = None;
+    ui.add_space(48.0);
+    ui.vertical_centered(|ui| {
+        crate::icons::tile(ui, Icon::Sparkle, theme::ACCENT, 40.0, theme::ACCENT_DIM, 12);
+        ui.add_space(14.0);
+        ui.label(RichText::new("What can I build for you?").size(22.0).strong().color(theme::TEXT));
+        ui.add_space(6.0);
+        ui.label(RichText::new(&welcome.route).size(12.5).color(theme::FAINT));
+        if let Some(error) = &welcome.error {
+            ui.add_space(8.0);
+            ui.label(RichText::new(shorten(error, 160)).size(12.0).color(theme::RED));
+        }
     });
+    ui.add_space(26.0);
+    for starter in &welcome.starters {
+        let row = theme::list_row(ui, false, false, |ui| {
+            ui.add_space(6.0);
+            icons::icon(ui, Icon::Reply, theme::FAINT, 15.0);
+            ui.add_space(10.0);
+            ui.add(egui::Label::new(RichText::new(starter).size(13.0).color(theme::DIM)).truncate());
+        });
+        if row.on_hover_text("put this in the prompt").clicked() {
+            chosen = Some(starter.clone());
+        }
+    }
+    chosen
+}
+
+/// A message the user sent: right-aligned, wrapped inside its bubble.
+///
+/// The bubble is measured before it is placed. A label in a right-to-left
+/// layout does not wrap, so a long prompt used to run out of the bubble and off
+/// the card's left edge, dragging every later full-width row out with it.
+///
+/// @param ui the interface to draw into
+/// @param text the message
+fn user_bubble(ui: &mut Ui, text: &str) {
+    let width = ui.available_width();
+    let max_text = (width * 0.78 - 28.0).max(60.0);
+    let galley = ui.painter().layout(
+        text.trim_end().to_string(),
+        egui::FontId::proportional(13.5),
+        theme::TEXT,
+        max_text,
+    );
+    let size = galley.size() + Vec2::new(28.0, 20.0);
+    let (row, response) =
+        ui.allocate_exact_size(Vec2::new(width, size.y), Sense::click());
+    let bubble = Rect::from_min_size(egui::pos2(row.right() - size.x, row.top()), size);
+    ui.painter()
+        .rect_filled(bubble, CornerRadius::same(theme::CARD_RADIUS), theme::ELEVATED);
+    ui.painter().galley(bubble.min + Vec2::new(14.0, 10.0), galley, theme::TEXT);
+    let copy = response.clone();
+    copy.context_menu(|ui| {
+        if ui.button("Copy").clicked() {
+            ui.ctx().copy_text(text.to_string());
+            ui.close();
+        }
+    });
+    if response.hovered() {
+        let mark = Rect::from_center_size(
+            egui::pos2(bubble.left() - 16.0, bubble.bottom() - 12.0),
+            Vec2::splat(20.0),
+        );
+        let hit = ui.interact(mark, ui.id().with(("copy-prompt", row.top() as i64)), Sense::click());
+        icons::paint(ui, Icon::Copy, mark.shrink(3.0), if hit.hovered() { theme::DIM } else { theme::FAINT });
+        if hit.on_hover_text("copy this message").clicked() {
+            ui.ctx().copy_text(text.to_string());
+        }
+    }
 }
 
 /// What a click on the answer's action row asked for.
@@ -897,32 +1037,27 @@ enum FailedAction {
     Route,
 }
 
-/// The row under a transcript whose turn failed: the two ways out of a dead end.
-///
-/// The reason is already in the transcript above — the failure wrote a notice —
-/// so this row is the repair: ask again, on this route or on another.
+/// The row under a transcript whose turn failed: what went wrong, and the two
+/// ways out of the dead end.
 ///
 /// @param ui the interface to draw into
+/// @param message why the turn failed, in one sentence
 /// @param can_retry whether there is a prompt to ask again
 /// @param model the route the session was on
 /// @returns what the user asked for, if anything
-fn failed_row(ui: &mut Ui, can_retry: bool, model: &str) -> Option<FailedAction> {
+fn failed_row(ui: &mut Ui, message: &str, can_retry: bool, model: &str) -> Option<FailedAction> {
     let mut action = None;
     egui::Frame::new()
         .fill(theme::RED.gamma_multiply(0.05))
         .stroke(egui::Stroke::new(1.0, theme::RED.gamma_multiply(0.28)))
         .corner_radius(CornerRadius::same(theme::RADIUS))
-        .inner_margin(egui::Margin::symmetric(12, 8))
+        .inner_margin(egui::Margin::symmetric(12, 10))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                icons::icon(ui, Icon::Sparkle, theme::RED, 14.0);
-                ui.add_space(9.0);
-                ui.label(
-                    RichText::new("the turn did not finish")
-                        .size(12.5)
-                        .color(theme::TEXT),
-                );
+                icons::icon(ui, Icon::Cross, theme::RED, 14.0);
+                ui.add_space(6.0);
+                ui.label(RichText::new("The turn did not finish").size(13.0).strong().color(theme::TEXT));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if theme::action(ui, "another route", true, theme::DIM)
                         .on_hover_text("open models and routes (⌘,)")
@@ -943,6 +1078,8 @@ fn failed_row(ui: &mut Ui, can_retry: bool, model: &str) -> Option<FailedAction>
                     }
                 });
             });
+            ui.add_space(6.0);
+            ui.add(egui::Label::new(RichText::new(message).size(12.5).color(theme::TEXT)).wrap());
             ui.add_space(4.0);
             ui.label(RichText::new(model).size(11.5).color(theme::FAINT));
         });
@@ -998,316 +1135,237 @@ fn working_row(ui: &mut Ui, activity: &crate::state::Activity) {
 
 /// The model's reasoning, folded away until it is asked for.
 ///
+/// While it streams it is drawn open, with its newest lines; once the answer
+/// starts it folds to one line that says how long it was.
+///
 /// @param ui the interface to draw into
 /// @param thinking the reasoning text
 /// @param open whether it is expanded
+/// @param live whether it is still streaming
 /// @returns true when the header was clicked
-fn thinking_view(ui: &mut Ui, thinking: &str, open: bool) -> bool {
-    let lines = thinking.lines().count();
-    let mut clicked = false;
-    ui.horizontal(|ui| {
-        let chevron = icons::button(ui, Icon::Chevron, theme::VIOLET, 20.0, theme::HOVER_SOFT);
-        let label = ui.add(
-            egui::Label::new(
-                RichText::new(format!("thought for {lines} line(s)"))
-                    .size(12.0)
-                    .color(theme::VIOLET.gamma_multiply(0.9)),
-            )
-            .sense(Sense::click()),
-        );
-        clicked = chevron.clicked() || label.clicked();
-    });
-    if open {
+fn thinking_view(ui: &mut Ui, thinking: &str, open: bool, live: bool) -> bool {
+    let lines = thinking.lines().filter(|line| !line.trim().is_empty()).count();
+    let (row, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), Sense::click());
+    let chevron = Rect::from_center_size(egui::pos2(row.left() + 8.0, row.center().y), Vec2::splat(12.0));
+    if open || live {
+        icons::paint(ui, Icon::Chevron, chevron, theme::FAINT);
+    } else {
+        icons::paint(ui, Icon::ArrowRight, chevron.shrink(1.0), theme::FAINT);
+    }
+    let label = if live {
+        "Thinking…".to_string()
+    } else {
+        format!("Thought · {lines} line(s)")
+    };
+    ui.painter().text(
+        egui::pos2(row.left() + 20.0, row.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(12.5),
+        if response.hovered() { theme::DIM } else { theme::FAINT },
+    );
+    let clicked = response.clicked();
+    if open || live {
         egui::Frame::new()
-            .fill(theme::VIOLET.gamma_multiply(0.06))
+            .stroke(Stroke::new(1.0, theme::BORDER))
             .corner_radius(CornerRadius::same(theme::RADIUS))
-            .inner_margin(egui::Margin::symmetric(12, 8))
+            .inner_margin(egui::Margin { left: 12, right: 10, top: 6, bottom: 6 })
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                for line in thinking.lines().take(THINKING_LINES) {
-                    ui.label(
-                        RichText::new(line)
+                let shown: Vec<&str> = if live {
+                    let all: Vec<&str> = thinking.lines().collect();
+                    all[all.len().saturating_sub(6)..].to_vec()
+                } else {
+                    thinking.lines().take(THINKING_LINES).collect()
+                };
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(shown.join("\n"))
                             .size(12.0)
                             .italics()
-                            .color(theme::VIOLET.gamma_multiply(0.8)),
-                    );
-                }
+                            .color(theme::DIM),
+                    )
+                    .wrap(),
+                );
             });
     }
-    // Open thought is a folded list, not a paragraph: the chevron points down.
-    let _ = open;
     clicked
 }
 
-/// An answer: prose with its code kept as code, and its inline code as chips.
+/// One piece of an answer: markdown prose, or a fenced block kept verbatim.
+enum Segment<'a> {
+    /// Markdown between fences.
+    Prose(String),
+    /// A fenced block: its info string and its lines.
+    Code(&'a str, Vec<&'a str>),
+}
+
+/// Splits an answer at its code fences.
 ///
-/// @param ui the interface to draw into
+/// Fenced blocks are drawn by this pane rather than by the markdown renderer
+/// because they carry the things a renderer wraps and breaks: ASCII diagrams,
+/// tables drawn in text, mermaid sources, and long lines of code. Here they
+/// keep every column, scroll sideways, and copy whole. An unterminated fence —
+/// an answer still streaming — is code up to the end.
+///
 /// @param text the answer
-/// @param font the monospace font
-fn prose(ui: &mut Ui, text: &str, font: &egui::FontId) {
-    let mut fence: Option<(String, Vec<&str>)> = None;
-    let mut paragraph: Vec<&str> = Vec::new();
-
+/// @returns the segments, in order
+fn segments(text: &str) -> Vec<Segment<'_>> {
+    let mut out = Vec::new();
+    let mut prose: Vec<&str> = Vec::new();
+    let mut fence: Option<(&str, &str, Vec<&str>)> = None;
     for line in text.lines() {
-        if let Some(info) = line.trim_start().strip_prefix("```") {
-            match fence.take() {
-                Some((language, body)) => code_block(ui, &language, &body),
-                None => {
-                    flush(ui, &mut paragraph);
-                    fence = Some((info.trim().to_string(), Vec::new()));
-                }
-            }
-            continue;
-        }
-        match fence.as_mut() {
-            Some((_, body)) => body.push(line),
-            None => paragraph.push(line),
-        }
-    }
-    // An unterminated fence is still the model's answer, so it is shown as code.
-    if let Some((language, body)) = fence {
-        code_block(ui, &language, &body);
-    }
-    flush(ui, &mut paragraph);
-    let _ = font;
-}
-
-/// Draws the prose lines gathered so far: bullets, then a wrapping paragraph.
-///
-/// @param ui the interface to draw into
-/// @param paragraph the lines, drained
-fn flush(ui: &mut Ui, paragraph: &mut Vec<&str>) {
-    let lines: Vec<String> = paragraph.iter().map(|line| line.to_string()).collect();
-    paragraph.clear();
-    let mut index = 0;
-    while index < lines.len() {
-        let line = lines[index].trim_end();
-        if line.trim().is_empty() {
-            index += 1;
-            continue;
-        }
         let trimmed = line.trim_start();
-        let bullet =
-            trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("• ");
-        if bullet {
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
-                inline_runs(ui, "• ", theme::DIM, false);
-                inline_runs(ui, trimmed[2..].trim_start(), theme::TEXT, false);
-            });
-            index += 1;
-            continue;
-        }
-        // A paragraph runs until a blank line, a bullet, or a fence.
-        let mut body = Vec::new();
-        while index < lines.len() {
-            let next = lines[index].trim_end();
-            let next_trimmed = next.trim_start();
-            let stops = next_trimmed.is_empty()
-                || next_trimmed.starts_with("- ")
-                || next_trimmed.starts_with("* ")
-                || next_trimmed.starts_with("• ");
-            if stops && !body.is_empty() {
-                break;
+        match fence.as_mut() {
+            Some((marker, _, body)) => {
+                if trimmed.starts_with(*marker) && trimmed.trim_start_matches(|c| c == '`' || c == '~').trim().is_empty() {
+                    let (_, info, body) = fence.take().expect("open fence");
+                    out.push(Segment::Code(info, body));
+                } else {
+                    body.push(line);
+                }
             }
-            if next_trimmed.is_empty() {
-                index += 1;
-                continue;
+            None => {
+                let marker = if trimmed.starts_with("```") {
+                    Some("```")
+                } else if trimmed.starts_with("~~~") {
+                    Some("~~~")
+                } else {
+                    None
+                };
+                match marker {
+                    Some(marker) => {
+                        if !prose.is_empty() {
+                            out.push(Segment::Prose(prose.join("\n")));
+                            prose.clear();
+                        }
+                        fence = Some((marker, trimmed[3..].trim(), Vec::new()));
+                    }
+                    None => prose.push(line),
+                }
             }
-            body.push(next.trim());
-            index += 1;
         }
-        let joined = body.join(" ");
-        let heading = joined.starts_with('#');
-        let text = if heading {
-            joined.trim_start_matches('#').trim_start()
-        } else {
-            joined.as_str()
-        };
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            inline_runs(
-                ui,
-                text,
-                if heading { theme::TEXT } else { theme::TEXT },
-                heading,
-            );
-        });
     }
+    if let Some((_, info, body)) = fence {
+        out.push(Segment::Code(info, body));
+    }
+    if !prose.is_empty() {
+        out.push(Segment::Prose(prose.join("\n")));
+    }
+    out
 }
 
-/// Draws one line's inline runs: plain words, `code` chips, and **emphasis**.
+/// An answer: markdown prose — headings, lists, tables, quotes, emphasis,
+/// inline code — with its fenced blocks drawn as code.
 ///
 /// @param ui the interface to draw into
-/// @param text the line
-/// @param colour the text colour
-/// @param heading whether the line is a heading
-fn inline_runs(ui: &mut Ui, text: &str, colour: egui::Color32, heading: bool) {
-    for run in runs(text) {
-        match run {
-            Run::Code(code) => {
-                let galley =
-                    ui.painter()
-                        .layout_no_wrap(code.clone(), theme::mono(12.5), theme::TEXT);
-                let padding = Vec2::new(4.0, 2.0);
-                let (rect, _) =
-                    ui.allocate_exact_size(galley.size() + padding * 2.0, Sense::hover());
-                let painter = ui.painter();
-                painter.rect_filled(rect, CornerRadius::same(4), theme::ELEVATED);
-                painter.galley(rect.min + padding, galley, theme::TEXT);
-                ui.add_space(3.0);
-            }
-            Run::Bold(strong) => {
-                for word in words(&strong) {
-                    ui.label(RichText::new(word).size(13.5).strong().color(colour));
+/// @param cache the markdown renderer's cache
+/// @param text the answer
+/// @param index the item's place in the transcript, for stable block ids
+fn answer(ui: &mut Ui, cache: &mut egui_commonmark::CommonMarkCache, text: &str, index: usize) {
+    if text.trim().is_empty() {
+        return;
+    }
+    for (block, segment) in segments(text).into_iter().enumerate() {
+        match segment {
+            Segment::Prose(prose) => {
+                if prose.trim().is_empty() {
+                    continue;
                 }
+                ui.scope(|ui| {
+                    ui.style_mut().override_font_id = None;
+                    ui.spacing_mut().item_spacing.y = 6.0;
+                    egui_commonmark::CommonMarkViewer::new()
+                        .default_width(Some(ui.available_width() as usize))
+                        .show(ui, cache, &prose);
+                });
             }
-            Run::Plain(plain) => {
-                for word in words(&plain) {
-                    ui.label(
-                        RichText::new(word)
-                            .size(if heading { 14.5 } else { 13.5 })
-                            .color(colour),
-                    );
-                }
+            Segment::Code(info, body) => {
+                ui.add_space(4.0);
+                code_block(ui, info, &body, ui.id().with(("code", index, block)));
+                ui.add_space(4.0);
             }
         }
     }
 }
 
-/// One piece of a line, by how it is marked up.
-enum Run {
-    /// Ordinary text.
-    Plain(String),
-    /// A `code` span.
-    Code(String),
-    /// A **strong** span.
-    Bold(String),
-}
-
-/// Splits a line into runs by its inline markup.
+/// A fenced block from an answer: its language, a copy button, and its lines
+/// exactly as written — never wrapped, scrolling sideways when wide, folded
+/// when long.
 ///
-/// @param text the line
-/// @returns the runs, in order
-fn runs(text: &str) -> Vec<Run> {
-    let mut runs = Vec::new();
-    let mut rest = text;
-    while !rest.is_empty() {
-        let code_at = rest.find('`');
-        let bold_at = rest.find("**");
-        let next = match (code_at, bold_at) {
-            (Some(code), Some(bold)) => Some(code.min(bold)),
-            (Some(code), None) => Some(code),
-            (None, Some(bold)) => Some(bold),
-            (None, None) => None,
-        };
-        let Some(at) = next else {
-            push_run(&mut runs, Run::Plain(rest.to_string()));
-            break;
-        };
-        if at > 0 {
-            push_run(&mut runs, Run::Plain(rest[..at].to_string()));
-        }
-        let tail = &rest[at..];
-        if tail.starts_with('`') {
-            match tail[1..].find('`') {
-                Some(end) => {
-                    push_run(&mut runs, Run::Code(tail[1..1 + end].to_string()));
-                    rest = &tail[end + 2..];
-                }
-                None => {
-                    push_run(&mut runs, Run::Plain(tail.to_string()));
-                    break;
-                }
-            }
-        } else {
-            match tail[2..].find("**") {
-                Some(end) => {
-                    push_run(&mut runs, Run::Bold(tail[2..2 + end].to_string()));
-                    rest = &tail[end + 4..];
-                }
-                None => {
-                    push_run(&mut runs, Run::Plain(tail.to_string()));
-                    break;
-                }
-            }
-        }
-    }
-    runs
-}
-
-/// Adds a run, merging adjacent plain runs so a line does not become a dozen.
-///
-/// @param runs the runs so far
-/// @param run the run to add
-fn push_run(runs: &mut Vec<Run>, run: Run) {
-    match (runs.last_mut(), run) {
-        (Some(Run::Plain(last)), Run::Plain(text)) => last.push_str(&text),
-        (_, run) => runs.push(run),
-    }
-}
-
-/// Splits text into words that keep their trailing space, so wrapping is even.
-///
-/// @param text the text
-/// @returns the words
-fn words(text: &str) -> Vec<String> {
-    let mut words: Vec<String> = Vec::new();
-    for (index, word) in text.split(' ').enumerate() {
-        if index == 0 {
-            words.push(word.to_string());
-        } else {
-            words.push(format!(" {word}"));
-        }
-    }
-    words.retain(|word| !word.is_empty());
-    words
-}
-
-/// A fenced code block from an answer.
+/// Diagrams are the reason for "exactly": box drawings and mermaid sources
+/// only read when every column stays where the model put it.
 ///
 /// @param ui the interface to draw into
 /// @param language the fence's info string
 /// @param body the lines
-fn code_block(ui: &mut Ui, language: &str, body: &[&str]) {
-    let shown = body.len().min(400);
-    let language = if language.is_empty() {
-        "text"
-    } else {
-        language
+/// @param id a stable id for the block's scroll and fold state
+fn code_block(ui: &mut Ui, language: &str, body: &[&str], id: egui::Id) {
+    let language = language.split_whitespace().next().unwrap_or("");
+    let label = match language {
+        "" => "text",
+        "mermaid" => "mermaid diagram",
+        other => other,
     };
+    let open_id = id.with("open");
+    let mut open = ui.ctx().data_mut(|data| *data.get_temp_mut_or(open_id, false));
+    let long = body.len() > CODE_FOLD_LINES;
+    let shown = if long && !open { CODE_FOLD_LINES } else { body.len().min(CODE_MAX_LINES) };
     let font = theme::mono(12.0);
     egui::Frame::new()
         .fill(theme::ELEVATED)
-        .corner_radius(CornerRadius::same(theme::RADIUS))
-        .inner_margin(egui::Margin::symmetric(12, 8))
+        .stroke(Stroke::new(1.0, theme::BORDER))
+        .corner_radius(CornerRadius::same(theme::RADIUS + 2))
+        .inner_margin(egui::Margin { left: 12, right: 8, top: 6, bottom: 8 })
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.label(RichText::new(language).size(11.0).color(theme::FAINT));
-                ui.label(
-                    RichText::new(format!("{} line(s)", body.len()))
-                        .size(11.0)
-                        .color(theme::FAINT),
-                );
+                ui.label(RichText::new(label).size(11.0).color(theme::FAINT));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let copy = icons::button(ui, Icon::Copy, theme::FAINT, 22.0, theme::HOVER);
+                    if copy.on_hover_text("copy").clicked() {
+                        ui.ctx().copy_text(body.join("\n"));
+                    }
+                    ui.label(RichText::new(format!("{} line(s)", body.len())).size(11.0).color(theme::FAINT));
+                });
             });
             ui.add_space(2.0);
             egui::ScrollArea::horizontal()
-                .id_salt(language)
+                .id_salt(id.with("scroll"))
+                .auto_shrink([false, true])
                 .show(ui, |ui| {
+                    let highlight = language != "mermaid" && !language.is_empty();
                     for line in &body[..shown] {
-                        let job = crate::code::highlight(language, line, &font, theme::TEXT);
-                        ui.label(job);
-                    }
-                    if body.len() > shown {
-                        ui.label(
-                            RichText::new(format!("… {} of {} lines", shown, body.len()))
-                                .size(11.0)
-                                .color(theme::AMBER),
-                        );
+                        let job = if highlight {
+                            crate::code::highlight(language, line, &font, theme::TEXT)
+                        } else {
+                            let mut job = egui::text::LayoutJob::default();
+                            job.append(line, 0.0, egui::TextFormat::simple(font.clone(), theme::TEXT));
+                            job
+                        };
+                        ui.add(egui::Label::new(job).extend());
                     }
                 });
+            if long {
+                ui.add_space(4.0);
+                let text = if open {
+                    "show less".to_string()
+                } else {
+                    format!("show all {} lines", body.len())
+                };
+                if theme::action(ui, &text, true, theme::ACCENT).clicked() {
+                    open = !open;
+                }
+            }
+            if body.len() > CODE_MAX_LINES && open {
+                ui.label(
+                    RichText::new(format!("… {} more lines — copy the block to read them all", body.len() - CODE_MAX_LINES))
+                        .size(11.0)
+                        .color(theme::AMBER),
+                );
+            }
         });
+    ui.ctx().data_mut(|data| data.insert_temp(open_id, open));
 }
 
 /// One tool call: a row that opens into its input and output.
@@ -1330,10 +1388,15 @@ fn tool_row(ui: &mut Ui, card: &ToolCard, reveal: Option<&str>) {
         open = true;
     }
     let icon = tool_icon(card);
-    let summary = card.summary();
+    // The row names what the call acted on — the command, the file, the
+    // pattern — and falls back to the engine's own summary only without one.
+    let summary = card
+        .input_text(&["command", "cmd", "file_path", "path", "pattern", "query", "url", "name"])
+        .unwrap_or_else(|| card.summary());
+    let verb = tool_verb(card);
     let elapsed = card
         .elapsed_ms
-        .map(|ms| format!("{ms} ms"))
+        .map(duration_label)
         .unwrap_or_default();
     let has_detail = !card.output.trim().is_empty() || card.input.is_some();
 
@@ -1354,48 +1417,35 @@ fn tool_row(ui: &mut Ui, card: &ToolCard, reveal: Option<&str>) {
             ui.horizontal(|ui| {
                 icons::tile(ui, icon, colour, 22.0, theme::ELEVATED, 6);
                 ui.add_space(9.0);
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(shorten(&card.title, 40))
-                            .size(12.5)
-                            .monospace()
-                            .color(if escalation {
-                                theme::VIOLET
-                            } else {
-                                theme::TEXT
-                            }),
-                    )
-                    .truncate(),
+                ui.label(
+                    RichText::new(verb)
+                        .size(12.5)
+                        .strong()
+                        .color(if escalation { theme::VIOLET } else { theme::TEXT }),
                 );
                 if !summary.is_empty() {
-                    ui.add_space(6.0);
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(shorten(&summary, 90))
-                                .size(12.0)
-                                .color(theme::DIM),
-                        )
-                        .truncate(),
-                    );
+                    ui.add_space(4.0);
+                    ui.scope(|ui| {
+                        ui.set_max_width((ui.available_width() - 110.0).max(40.0));
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(first_line(&summary))
+                                    .size(12.0)
+                                    .monospace()
+                                    .color(theme::DIM),
+                            )
+                            .truncate(),
+                        );
+                    });
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    match card.status {
-                        ToolStatus::Pending | ToolStatus::Running => {
-                            icons::icon(ui, Icon::Ring, colour, 13.0);
-                        }
-                        ToolStatus::Completed => {
-                            icons::icon(ui, Icon::Check, colour, 13.0);
-                        }
-                        ToolStatus::Failed => {
-                            icons::icon(ui, Icon::More, colour, 13.0);
-                        }
-                    }
+                    status_mark(ui, card.status, colour);
                     ui.add_space(6.0);
                     if !elapsed.is_empty() {
                         ui.label(RichText::new(elapsed).size(11.0).color(theme::FAINT));
                     }
                     if has_detail {
-                        icons::icon(ui, Icon::Chevron, theme::FAINT, 12.0);
+                        icons::icon(ui, if open { Icon::Chevron } else { Icon::ArrowRight }, theme::FAINT, 12.0);
                     }
                 });
             });
@@ -1404,10 +1454,10 @@ fn tool_row(ui: &mut Ui, card: &ToolCard, reveal: Option<&str>) {
                 if let Some(input) = &card.input {
                     let text =
                         serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string());
-                    detail(ui, "input", &shorten_lines(&text, 40), theme::DIM);
+                    detail(ui, "input", &shorten_lines(&text, 40), theme::DIM, &card.id);
                 }
                 if !card.output.trim().is_empty() {
-                    detail(ui, "output", &card.output, theme::TEXT);
+                    detail(ui, "output", &card.output, theme::TEXT, &card.id);
                 }
                 if !card.locations.is_empty() {
                     ui.add_space(4.0);
@@ -1438,7 +1488,8 @@ fn tool_row(ui: &mut Ui, card: &ToolCard, reveal: Option<&str>) {
 /// @param label the block's name
 /// @param text the block's text
 /// @param colour the text colour
-fn detail(ui: &mut Ui, label: &str, text: &str, colour: egui::Color32) {
+/// @param call the call it belongs to: scroll areas need ids unique to the call
+fn detail(ui: &mut Ui, label: &str, text: &str, colour: egui::Color32, call: &str) {
     ui.label(RichText::new(label).size(11.0).color(theme::FAINT));
     egui::Frame::new()
         .fill(theme::ELEVATED)
@@ -1447,14 +1498,84 @@ fn detail(ui: &mut Ui, label: &str, text: &str, colour: egui::Color32) {
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             egui::ScrollArea::horizontal()
-                .id_salt(label)
+                .id_salt(("detail", call, label))
+                .auto_shrink([false, true])
                 .show(ui, |ui| {
-                    for line in text.lines().take(TOOL_OUTPUT_LINES) {
-                        ui.label(RichText::new(line).size(12.0).monospace().color(colour));
+                    let lines: Vec<&str> = text.lines().take(TOOL_OUTPUT_LINES).collect();
+                    ui.add(
+                        egui::Label::new(RichText::new(lines.join("\n")).size(12.0).monospace().color(colour))
+                            .extend(),
+                    );
+                    let total = text.lines().count();
+                    if total > TOOL_OUTPUT_LINES {
+                        ui.label(
+                            RichText::new(format!("… {} more line(s)", total - TOOL_OUTPUT_LINES))
+                                .size(11.0)
+                                .color(theme::FAINT),
+                        );
                     }
                 });
         });
     ui.add_space(4.0);
+}
+
+/// A call's status as a mark: a turning ring while it runs, a check, or a cross.
+///
+/// @param ui the interface to draw into
+/// @param status the call's status
+/// @param colour the status colour
+fn status_mark(ui: &mut Ui, status: ToolStatus, colour: egui::Color32) {
+    match status {
+        ToolStatus::Pending | ToolStatus::Running => {
+            theme::spinner(ui, 13.0, colour);
+        }
+        ToolStatus::Completed => {
+            icons::icon(ui, Icon::Check, colour, 13.0);
+        }
+        ToolStatus::Failed => {
+            icons::icon(ui, Icon::Cross, colour, 13.0);
+        }
+    }
+}
+
+/// A duration the way a row prints it: `420 ms`, `3.2 s`, `1 m 04 s`.
+///
+/// @param ms milliseconds
+/// @returns the label
+fn duration_label(ms: u64) -> String {
+    match ms {
+        0..=999 => format!("{ms} ms"),
+        1_000..=59_999 => format!("{:.1} s", ms as f64 / 1_000.0),
+        _ => format!("{} m {:02} s", ms / 60_000, (ms % 60_000) / 1_000),
+    }
+}
+
+/// What a tool call did, as the verb its row leads with.
+///
+/// @param card the call
+/// @returns a short past-tense verb
+fn tool_verb(card: &ToolCard) -> String {
+    let name = card.title.trim().to_ascii_lowercase();
+    let verb = match name.as_str() {
+        "read" | "read_file" | "view" => "Read",
+        "grep" | "search" | "rg" => "Searched",
+        "glob" | "ls" | "list" => "Listed",
+        "bash" | "pwsh" | "shell" | "execute" | "bash_persistent" | "pwsh_persistent" => "Ran",
+        "write" => "Wrote",
+        "edit" | "str_replace_editor" => "Edited",
+        "todo_write" => "Updated the plan",
+        "web_fetch" | "fetch" => "Fetched",
+        "web_search" => "Searched the web",
+        "skill" => "Loaded a skill",
+        "spec_get" => "Read the spec",
+        "spec_amend" => "Amended the spec",
+        "wave_plan" => "Planned waves",
+        "job_output" => "Read job output",
+        "job_list" => "Listed jobs",
+        "job_kill" => "Stopped a job",
+        _ => return card.title.trim().to_string(),
+    };
+    verb.to_string()
 }
 
 /// A delegation: who is working, on what, and what came back.
@@ -1480,19 +1601,36 @@ fn agent_card(ui: &mut Ui, card: &ToolCard, reveal: Option<&str>) {
     if reveal == Some(card.id.as_str()) {
         open = true;
     }
-    let headline = card
-        .input_text(&["description", "decision", "task", "summary"])
-        .unwrap_or_else(|| card.title.clone());
-    let handed = card.input_text(&["prompt", "evidence"]);
+    // A wave is one call and several agents: it is headed by how many parts it
+    // ran, and its closed card shows every part's line rather than the first few.
+    let wave = card.title.trim().eq_ignore_ascii_case("run_wave");
+    let parts = card
+        .input
+        .as_ref()
+        .and_then(|input| input.get("parts"))
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let headline = if wave {
+        format!("Ran {parts} part(s) as parallel subagents")
+    } else {
+        card.input_text(&["description", "decision", "task", "summary"])
+            .unwrap_or_else(|| card.title.clone())
+    };
+    let handed = if wave {
+        None
+    } else {
+        card.input_text(&["prompt", "evidence"])
+    };
     let elapsed = card
         .elapsed_ms
-        .map(|ms| format!("{ms} ms"))
+        .map(duration_label)
         .unwrap_or_default();
     let result: Vec<&str> = card
         .output
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .take(AGENT_RESULT_LINES)
+        .take(if wave { WAVE_RESULT_LINES } else { AGENT_RESULT_LINES })
         .collect();
 
     // The right group needs room for a status word, its mark, and a time; the
@@ -1566,10 +1704,10 @@ fn agent_card(ui: &mut Ui, card: &ToolCard, reveal: Option<&str>) {
                 if let Some(input) = &card.input {
                     let text =
                         serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string());
-                    detail(ui, "input", &shorten_lines(&text, 40), theme::DIM);
+                    detail(ui, "input", &shorten_lines(&text, 40), theme::DIM, &card.id);
                 }
                 if !card.output.trim().is_empty() {
-                    detail(ui, "result", &card.output, theme::TEXT);
+                    detail(ui, "result", &card.output, theme::TEXT, &card.id);
                 }
             } else if !result.is_empty() {
                 // A line of rule, then the answer's opening: enough to see how
@@ -1601,7 +1739,8 @@ fn agent_card(ui: &mut Ui, card: &ToolCard, reveal: Option<&str>) {
     ui.ctx().data_mut(|data| data.insert_temp(open_id, open));
 }
 
-/// A file change: the path, the tally, and the lines themselves.
+/// A file the agent created or changed, as a file card: its type, its name and
+/// folder, the tally, and an Open button; the lines themselves below.
 ///
 /// The engine sends the call's arguments and its one-line confirmation, not a
 /// patch, so the diff is derived from the arguments the model wrote — the text
@@ -1612,7 +1751,8 @@ fn agent_card(ui: &mut Ui, card: &ToolCard, reveal: Option<&str>) {
 /// @param card the call
 /// @param change the derived change
 /// @param reveal the call the panel asked to open
-fn change_card(ui: &mut Ui, card: &ToolCard, change: &FileChange, reveal: Option<&str>) {
+/// @returns true when Open was clicked
+fn change_card(ui: &mut Ui, card: &ToolCard, change: &FileChange, reveal: Option<&str>) -> bool {
     let colour = match card.status {
         ToolStatus::Pending | ToolStatus::Running => theme::AMBER,
         ToolStatus::Completed => theme::GREEN,
@@ -1625,99 +1765,98 @@ fn change_card(ui: &mut Ui, card: &ToolCard, change: &FileChange, reveal: Option
     if reveal == Some(card.id.as_str()) {
         open = true;
     }
-    let elapsed = card
-        .elapsed_ms
-        .map(|ms| format!("{ms} ms"))
-        .unwrap_or_default();
+    let (folder, name) = match change.path.rsplit_once(['/', '\\']) {
+        Some((folder, name)) => (folder.to_string(), name.to_string()),
+        None => (String::new(), change.path.clone()),
+    };
+    let created = change.removed.is_empty();
+    let mut open_file = false;
+    let mut toggle = false;
 
-    let response = egui::Frame::new()
+    egui::Frame::new()
         .fill(theme::PANEL)
-        .stroke(Stroke::new(
-            1.0,
-            if open {
-                theme::BORDER_STRONG
-            } else {
-                theme::BORDER
-            },
-        ))
-        .corner_radius(CornerRadius::same(theme::RADIUS))
-        .inner_margin(egui::Margin::symmetric(10, 7))
+        .stroke(Stroke::new(1.0, if open { theme::BORDER_STRONG } else { theme::BORDER }))
+        .corner_radius(CornerRadius::same(theme::RADIUS + 2))
+        .inner_margin(egui::Margin::symmetric(10, 8))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                icons::tile(ui, Icon::Doc, theme::GREEN, 22.0, theme::ELEVATED, 6);
-                ui.add_space(9.0);
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(shorten(&change.path, 64))
-                            .size(12.0)
-                            .monospace()
-                            .color(theme::TEXT),
-                    )
-                    .truncate(),
-                );
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    match card.status {
-                        ToolStatus::Pending | ToolStatus::Running => {
-                            icons::icon(ui, Icon::Ring, colour, 13.0);
-                        }
-                        ToolStatus::Completed => {
-                            icons::icon(ui, Icon::Check, colour, 13.0);
-                        }
-                        ToolStatus::Failed => {
-                            icons::icon(ui, Icon::More, colour, 13.0);
-                        }
-                    }
-                    ui.add_space(6.0);
-                    if !elapsed.is_empty() {
-                        ui.label(RichText::new(elapsed).size(11.0).color(theme::FAINT));
-                        ui.add_space(6.0);
-                    }
-                    if change.removed.is_empty() {
-                        ui.label(
-                            RichText::new(format!("+{} line(s)", change.added.len()))
-                                .size(11.0)
-                                .color(theme::GREEN),
+            let header = ui.horizontal(|ui| {
+                crate::shell::file_tile(ui, &name, 34.0);
+                ui.add_space(8.0);
+                ui.scope(|ui| {
+                    ui.set_max_width((ui.available_width() - 150.0).max(60.0));
+                    ui.vertical(|ui| {
+                        ui.add(
+                            egui::Label::new(RichText::new(&name).size(13.0).strong().color(theme::TEXT))
+                                .truncate()
+                                .selectable(false),
                         );
-                    } else {
+                        let sub = format!(
+                            "{}{}",
+                            if created { "created" } else { "edited" },
+                            if folder.is_empty() { String::new() } else { format!(" · {folder}") }
+                        );
+                        ui.add(
+                            egui::Label::new(RichText::new(sub).size(11.5).color(theme::FAINT))
+                                .truncate()
+                                .selectable(false),
+                        );
+                    });
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if theme::action(ui, "Open", card.status.done(), theme::ACCENT)
+                        .on_hover_text("open the file in the editor")
+                        .clicked()
+                    {
+                        open_file = true;
+                    }
+                    status_mark(ui, card.status, colour);
+                    ui.add_space(4.0);
+                    if !change.removed.is_empty() {
                         ui.label(
                             RichText::new(format!("-{}", change.removed.len()))
-                                .size(11.0)
+                                .size(11.5)
+                                .monospace()
                                 .color(theme::RED),
                         );
-                        ui.label(
-                            RichText::new(format!("+{}", change.added.len()))
-                                .size(11.0)
-                                .color(theme::GREEN),
-                        );
                     }
+                    ui.label(
+                        RichText::new(format!("+{}", change.added.len()))
+                            .size(11.5)
+                            .monospace()
+                            .color(theme::GREEN),
+                    );
                 });
             });
-            ui.add_space(5.0);
-            let budget = if open {
-                CHANGE_LINES_OPEN
-            } else {
-                CHANGE_LINES
-            };
-            diff_lines(ui, change, budget);
-            if open {
-                if let Some(input) = &card.input {
-                    ui.add_space(6.0);
-                    let text =
-                        serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string());
-                    detail(ui, "input", &shorten_lines(&text, 40), theme::DIM);
-                }
-                if !card.output.trim().is_empty() {
-                    detail(ui, "output", &card.output, theme::TEXT);
-                }
+            let header_hit = ui.interact(
+                header.response.rect,
+                ui.id().with(("change-head", card.id.as_str())),
+                Sense::click(),
+            );
+            if header_hit
+                .on_hover_text(if open { "fold the change" } else { "show the whole change" })
+                .clicked()
+            {
+                toggle = true;
             }
-        })
-        .response;
+            if open {
+                ui.add_space(6.0);
+                diff_lines(ui, change, CHANGE_LINES_OPEN);
+                if !card.output.trim().is_empty() {
+                    ui.add_space(4.0);
+                    detail(ui, "result", &card.output, theme::TEXT, &card.id);
+                }
+            } else if !change.added.is_empty() || !change.removed.is_empty() {
+                ui.add_space(6.0);
+                diff_lines(ui, change, CHANGE_LINES);
+            }
+        });
 
-    if response.interact(Sense::click()).clicked() {
+    if toggle {
         open = !open;
     }
     ui.ctx().data_mut(|data| data.insert_temp(open_id, open));
+    open_file
 }
 
 /// A change's lines: what was removed, then what was added, each per side.
@@ -1905,7 +2044,7 @@ fn notice(ui: &mut Ui, level: NoticeLevel, text: &str) {
     ui.horizontal(|ui| {
         icons::icon(ui, Icon::Sparkle, colour, 13.0);
         ui.add_space(6.0);
-        ui.label(RichText::new(text).size(12.5).color(colour));
+        ui.add(egui::Label::new(RichText::new(text).size(12.5).color(colour)).wrap());
     });
 }
 
@@ -1962,4 +2101,37 @@ fn shorten_lines(text: &str, lines: usize) -> String {
         out.push_str("\n… (truncated)");
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_transcript_rows_stay_within_the_reading_column() {
+        for width in [320.0, 480.0, 860.0] {
+            let ctx = egui::Context::default();
+            // `answer()` rasterises glyphs the first time they are drawn, which
+            // queues a texture delta in the output; epaint's own drop guard
+            // panics if that delta is discarded unhandled, so it has to be
+            // cleared explicitly — a test-harness detail, not app behaviour.
+            let mut output = ctx.run_ui(egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(width, 900.0))),
+                ..Default::default()
+            }, |ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                let bound = ui.available_width();
+                notice(ui, NoticeLevel::Info, &"Model route selected; the key is read from the workspace environment. ".repeat(14));
+                assert!(ui.min_rect().width() <= bound + 1.0, "notice overflow at {width}");
+                thinking_view(ui, &"Inspecting the workspace and following the user's original request. ".repeat(14), true, false);
+                assert!(ui.min_rect().width() <= bound + 1.0, "thought overflow at {width}");
+                let mut cache = egui_commonmark::CommonMarkCache::default();
+                answer(ui, &mut cache, &"A detailed response with enough prose to wrap across several lines. ".repeat(14), 0);
+                assert!(ui.min_rect().width() <= bound + 1.0, "answer overflow at {width}");
+                failed_row(ui, &"The provider is temporarily rate-limited. ".repeat(14), true, "a/very/long/model/route");
+                assert!(ui.min_rect().width() <= bound + 1.0, "error overflow at {width}");
+            });
+            output.textures_delta.clear();
+        }
+    }
 }

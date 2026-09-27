@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 
-import { Config, DEFAULT_API_KEY_ENV, DEFAULT_MODELS_FILE, UNCONFIGURED_ROUTE, fallbackProfile, plainOptions, resolveOptions, routeProfiles, unconfiguredProfile } from '../src/index.ts'
+import { Config, DEFAULT_API_KEY_ENV, DEFAULT_MAX_TOKENS, DEFAULT_MODELS_FILE, UNCONFIGURED_ROUTE, fallbackProfile, plainOptions, resolveDefaultMaxTokens, resolveOptions, routeProfiles, unconfiguredProfile } from '../src/index.ts'
 import { ModelsDocumentError, documentSignature, parseModelsDocument, readModelsDocument } from '../src/index.ts'
 
 /** A document with one complete route, as the application writes it. */
@@ -142,4 +142,68 @@ test('any declared route suppresses the placeholder', () => {
   assert.deepEqual(Object.keys(merged), ['default'])
   // The document overrides the fallback per key; the placeholder stays out.
   assert.equal(merged.default?.baseURL, 'https://example.test/v1')
+})
+
+
+test('invalid endpoints fail before a request without echoing embedded secrets', () => {
+  for (const baseURL of ['openrouter.ai/api/v1', 'https://', 'file:///tmp/api', 'https://host/v1 secret', 'https://secret@host/v1', 'https://host/v1?key=secret']) {
+    assert.throws(() => parseModelsDocument({ providers: { test: { baseURL } } }, 'models.json'), error => {
+      assert.match(String(error), /providers.test: baseURL must/u)
+      assert.doesNotMatch(String(error), /secret/u)
+      return true
+    })
+    assert.throws(() => fallbackProfile('default', { baseURL, model: 'test' }), /baseURL must/u)
+  }
+  for (const providers of [null, [], 'wrong']) {
+    assert.throws(() => parseModelsDocument({ providers }, 'models.json'), /providers must be an object/u)
+  }
+})
+
+test("a route with no output cap of its own gets this harness's conservative default on its MODEL entry, whoever declared it", () => {
+  // The exact bug this pins, twice over. First: a route added through the
+  // app's model dialog — not the cordis.yml fallback — was left with no cap
+  // at all, so dsh's own larger fallback applied and a provider with a
+  // smaller per-model ceiling (Groq is one) rejected every request outright.
+  // Second, a real regression in the first fix for it: the harness patched
+  // the profile's own `defaultMaxTokens` field, which only sizes dsh's
+  // internal catalog bookkeeping and never reaches the wire request at all —
+  // only a PER-MODEL `maxTokens` becomes the adapter's `configuredMaxTokens`
+  // and so the agent loop's actual request default. Setting the wrong field
+  // looked identical in a config dump and still produced the exact same
+  // failure in practice.
+  delete process.env.AI_MAX_TOKENS
+  const document = { qwen: fallbackProfile('qwen', { baseURL: 'https://api.groq.com/openai/v1', model: 'qwen/qwen3.8-27b' }) }
+  const profiles = routeProfiles(undefined, document)
+  assert.equal(profiles.qwen?.models?.[0]?.maxTokens, DEFAULT_MAX_TOKENS)
+  assert.equal(resolveDefaultMaxTokens(), DEFAULT_MAX_TOKENS)
+})
+
+test('a model that already declares its own output cap is left exactly as configured', () => {
+  const declared = fallbackProfile('qwen', { baseURL: 'https://api.groq.com/openai/v1', model: 'qwen/qwen3.8-27b', maxTokens: 16_384 })
+  const document = { qwen: declared }
+  const profiles = routeProfiles(undefined, document)
+  assert.equal(profiles.qwen?.models?.[0]?.maxTokens, 16_384, 'an explicit choice is never overridden')
+})
+
+test('a route serving the installed catalog as-is (no models declared) is left alone', () => {
+  const document = { qwen: { baseURL: 'https://api.groq.com/openai/v1' } }
+  const profiles = routeProfiles(undefined, document)
+  assert.equal(profiles.qwen?.models, undefined, "the installed catalog's own capacities are real capabilities, not a gap")
+})
+
+test('AI_MAX_TOKENS raises or lowers the default for every model that leaves it unset', () => {
+  process.env.AI_MAX_TOKENS = '4096'
+  try {
+    assert.equal(resolveDefaultMaxTokens(), 4_096)
+    const document = { a: fallbackProfile('a', { baseURL: 'https://example.test/v1', model: 'x' }) }
+    assert.equal(routeProfiles(undefined, document).a?.models?.[0]?.maxTokens, 4_096)
+  } finally {
+    delete process.env.AI_MAX_TOKENS
+  }
+  process.env.AI_MAX_TOKENS = 'not-a-number'
+  try {
+    assert.equal(resolveDefaultMaxTokens(), DEFAULT_MAX_TOKENS, 'garbage input falls back rather than producing NaN')
+  } finally {
+    delete process.env.AI_MAX_TOKENS
+  }
 })

@@ -23,16 +23,33 @@ export const CONTRACT_SECTION = 'harness:operating-contract'
  */
 const CONTRACT = [
   'Operating contract of this harness:',
-  '1. The frozen session spec is the job. Build what it asks and nothing it does not; never widen it on your own.',
-  '2. Decompose before editing. When a job has two or more parts, call wave_plan with each part and the files it will'
-    + ' touch, then work the waves in order. Parts inside one wave are independent and may run together (subagent).',
-  '3. Prove before you build: give each subtask a check you can run (a test, a command, a diff assertion) before writing'
-    + ' its implementation, and run that check again after.',
-  '4. No runnable check for a subtask means the subtask is unverified: convene committee on it before reporting it done,'
-    + ' and act on the quorum verdict.',
-  '5. A failed check re-enters composition for that subtask alone. Never redo work a passing check already proved.',
-  '6. The harness enforces the budget itself. When it warns you, land the subtask in flight and report — do not start'
-    + ' anything new.',
+  '1. The frozen spec — the task you were most recently given — is the job. Build what it asks and nothing it does not;'
+    + ' never widen it on your own.',
+  '2. Starting a new project or a substantial new feature (a web app, a service, anything with more than a couple of'
+    + ' files): before writing any file, write a short plan — the stack, the folder layout, the modules and what each'
+    + ' owns, the data flow — as a few lines in your reply or a short PLAN.md. Then create files in that structure, not'
+    + ' ad hoc. Skip this for a small fix in an existing project; the plan is the thing that makes generated projects'
+    + ' look hand-organised instead of dumped.',
+  '3. Decompose and delegate BEFORE writing a single file, whenever the plan from rule 2 names more than one file to'
+    + ' create. An implementation plus its tests is already two parts, and a README makes three — this is the normal'
+    + ' shape of almost every build task, not a special case, and it applies however small or simple the task reads.'
+    + ' Call run_wave exactly once with every part named in your plan (its task, the files it owns, its check — e.g.'
+    + ' "core", "tests", "docs") and let the harness run them as parallel subagents; do not ask the user for permission'
+    + ' first and do not write any of those files yourself. Reserve doing it yourself for a genuine one-file change or a'
+    + ' single bug fix, where a second agent would have nothing separate to own.',
+  '4. Locate before reading: grep/glob for the names, messages, and paths the task mentions, then read only the regions'
+    + ' you need (offset/limit), not whole large files.',
+  '5. Reproduce before fixing: when the task reports a bug, run or write the smallest check that shows it (an existing'
+    + ' test, a new test in the repo\'s own framework, or a one-off command) and watch it fail.',
+  '6. Fix the root cause with the smallest change, in the code the task is about. Never weaken, skip, or delete existing'
+    + ' tests to make a check pass, and keep behaviour the task did not mention unchanged.',
+  '7. Verify: re-run the reproducing check and the existing tests nearest the change (or, after a run_wave, the checks'
+    + ' every part reported); a part is done only when they pass. Read the exit code of every command.',
+  '8. Clean up: delete scratch scripts and temporary files you created; keep a new test only if it belongs in the suite.',
+  '9. Only when no runnable check can settle a decision, convene committee on that one decision and act on its verdict.'
+    + ' A failed check re-enters work for that part alone; never redo work a passing check already proved.',
+  '10. When the harness warns about budget or steps, converge: finish and verify the change in flight, then report.',
+  '11. End with a short report: what was built or fixed, the files changed, and each check command with its result.',
 ].join('\n')
 
 /**
@@ -47,6 +64,12 @@ export function contractText(): string {
 export const WAVE_PLAN_DESCRIPTION = 'Partition a decomposed job into waves that are safe to run in parallel: no wave ever holds two'
   + ' subtasks that declare the same file. Call it once you know each part and its files, before you edit anything.'
   + ' Work the waves in order; the parts inside one wave may be delegated together with subagent.'
+
+/** Model-facing description of the `run_wave` tool. */
+export const RUN_WAVE_DESCRIPTION = 'Build a multi-part job with parallel subagents in one call. Give every part its task,'
+  + ' the files it owns, and the command that proves it; parts that share no file run at the same time, the rest in'
+  + ' later waves, and each part\'s agent may write only its own files. Returns every part\'s status and summary. Use it'
+  + ' when a job has two or more parts with different files; do a single part yourself.'
 
 /** Model-facing description of the `committee` tool. */
 export const COMMITTEE_DESCRIPTION = 'Put one decision in front of independent reviewers and get their verdicts plus the quorum'

@@ -12,13 +12,12 @@
 //     `cwd`, and this wrapper reads it from `HARNESS_WORKSPACE` (the app sets it
 //     when it opens a different folder) to know whose route document to read.
 //   * The route comes from the workspace's `.harness/models.json`'s `active`
-//     entry — falling back to the repository's own document, the deployment
-//     fallback (`AI_HARNESS_FALLBACK_MODEL`/`_BASE_URL`), or the provider's
-//     built-in placeholder route, in that order. The composition ships no model,
-//     so an unconfigured workspace opens sessions on the placeholder (and
-//     prompts fail until one is added); the wrapper says so on stderr and starts
-//     anyway. The provider itself reads the same document — its path travels in
-//     the generated overlay, because the plugin resolves a relative one against
+//     entry — falling back to the repository's own document, then the
+//     composition's default route: AI_MODEL at AI_BASE_URL, OpenRouter's
+//     DeepSeek when neither is set (see cordis.yml). So a clean clone with only
+//     AI_API_KEY runs; the application or AI_MODEL chooses another model. The
+//     provider itself reads the same document — its path travels in the
+//     generated overlay, because the plugin resolves a relative one against
 //     the engine's working directory, which is always this repository.
 //
 // The ACP bridge is the profile's application, not a flag: `hackathon-harness`
@@ -33,7 +32,7 @@
 //   HARNESS_WORKSPACE  the folder the agent serves (default: <repo>)
 
 import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -46,36 +45,107 @@ const home = process.env.DSH_HOME?.trim() ? resolve(process.env.DSH_HOME) : join
 const workspace = process.env.HARNESS_WORKSPACE?.trim() ? resolve(process.env.HARNESS_WORKSPACE) : repo
 const modelsFiles = [...new Set([join(workspace, '.harness', 'models.json'), join(repo, '.harness', 'models.json')])]
 
+/** The route the composition serves when no models document names one (cordis.yml's defaultRoute). */
+const DEFAULT_MODEL = 'deepseek/deepseek-v4-flash'
+/** The endpoint of that route. */
+const DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1'
+/** The working context the default route advertises, which is what compaction works within. */
+const DEFAULT_CONTEXT_WINDOW = '131072'
+/**
+ * Output tokens one response of the default route may use.
+ *
+ * Deliberately conservative rather than dsh's own 32768 fallback: some
+ * providers (Groq is one) reject a request above their own per-model output
+ * ceiling even though it is well under the model's context window, and dsh's
+ * fallback applies whenever a route's config does not set `maxTokens`
+ * explicitly — which the default route never did until this was added, so a
+ * route on such a provider failed every turn with "max_completion_tokens must
+ * be less than or equal to ...". 8192 is comfortably under every such ceiling
+ * seen in practice; raise it with AI_MAX_TOKENS for a route that allows more.
+ */
+const DEFAULT_MAX_TOKENS = '8192'
+
+/**
+ * The harness's own `AI_*` settings from the `.env` files, for the engine's
+ * process environment.
+ *
+ * The composition reads `AI_MODEL`, `AI_BASE_URL`, and `AI_CONTEXT_WINDOW` from
+ * `process.env` when it is loaded, which is before any `.env` layer the engine
+ * itself applies — so an evaluator who writes the model into `.env` beside
+ * `AI_API_KEY` would otherwise get the default model. The workspace's file wins
+ * over the repository's, and a variable already exported in the shell wins
+ * over both. Only `AI_*` names are taken: this is the harness's settings
+ * channel, not a general environment loader.
+ * @returns the variables to add to the engine's environment.
+ */
+function dotenvSettings() {
+  const settings = {}
+  for (const dir of [...new Set([repo, workspace])]) {
+    const path = join(dir, '.env')
+    if (!existsSync(path)) continue
+    for (const raw of readFileSync(path, 'utf8').split(/\r?\n/u)) {
+      const line = raw.trim()
+      if (line.length === 0 || line.startsWith('#')) continue
+      const match = /^(?:export\s+)?(AI_[A-Z0-9_]*)\s*=\s*(.*)$/u.exec(line)
+      if (match === null) continue
+      let value = match[2].trim()
+      if (value.length >= 2 && (value[0] === '"' || value[0] === "'") && value.at(-1) === value[0]) {
+        value = value.slice(1, -1)
+      }
+      settings[match[1]] = value
+    }
+  }
+  for (const name of Object.keys(settings)) {
+    if (process.env[name]?.trim()) delete settings[name]
+  }
+  return settings
+}
+
+const settings = dotenvSettings()
+/** One harness setting, from the shell first and the `.env` files second. */
+const setting = name => process.env[name]?.trim() || settings[name]?.trim() || undefined
+
+/**
+ * The default route, resolved once here and handed to the engine as plain
+ * environment: the overlay below has to restate the provider row's whole
+ * config, and resolving the values in one place keeps the row the overlay
+ * writes and the route the `acp` row names from ever disagreeing.
+ */
+const route = {
+  AI_MODEL: setting('AI_MODEL') ?? setting('AI_HARNESS_FALLBACK_MODEL') ?? DEFAULT_MODEL,
+  AI_BASE_URL: setting('AI_BASE_URL') ?? setting('AI_HARNESS_FALLBACK_BASE_URL') ?? DEFAULT_BASE_URL,
+  AI_CONTEXT_WINDOW: setting('AI_CONTEXT_WINDOW') ?? DEFAULT_CONTEXT_WINDOW,
+  AI_MAX_TOKENS: setting('AI_MAX_TOKENS') ?? DEFAULT_MAX_TOKENS,
+}
+
 /**
  * The route the next session starts on.
  *
  * The acp row ships a default provider this composition disables, so every
  * launch has to name one explicitly. The workspace's document's `active` entry
- * wins; with none, the repository's document; then the deployment fallback
- * (which the provider serves under the `default` key); then the provider's
- * built-in placeholder route — a session, and only a session, can be opened on
- * it, which is what an unconfigured workspace gets.
+ * wins; with none, the repository's document; then the composition's default
+ * route, which the provider serves under the `default` key.
  * @returns the chosen provider and model.
  */
 function selection() {
-  for (const modelsFile of modelsFiles) {
-    if (!existsSync(modelsFile)) continue
+  for (const path of modelsFiles) {
+    if (!existsSync(path)) continue
     let document
     try {
-      document = JSON.parse(readFileSync(modelsFile, 'utf8'))
+      document = JSON.parse(readFileSync(path, 'utf8'))
     } catch (error) {
-      process.stderr.write(`run-acp: cannot read ${modelsFile}: ${String(error)}\n`)
-      continue
+      process.stderr.write(`run-acp: cannot read ${path}: ${String(error)}\n`)
+      process.exit(1)
     }
     const active = document?.active
     if (active !== undefined && typeof active.provider === 'string' && typeof active.model === 'string') {
       return { provider: active.provider, model: active.model, placeholder: false }
     }
   }
-  const fallbackModel = process.env.AI_HARNESS_FALLBACK_MODEL?.trim()
-  const fallbackBaseURL = process.env.AI_HARNESS_FALLBACK_BASE_URL?.trim()
-  if (fallbackModel && fallbackBaseURL) return { provider: 'default', model: fallbackModel, placeholder: false }
-  return { provider: 'unconfigured', model: 'unconfigured', placeholder: true }
+  // cordis.yml always declares the default route, under the `default` key:
+  // AI_MODEL (or the older fallback name) when set, OpenRouter's DeepSeek
+  // otherwise. The model named here has to be the one that row serves.
+  return { provider: 'default', model: route.AI_MODEL, placeholder: false }
 }
 
 /**
@@ -89,7 +159,7 @@ function selection() {
  * @returns the document path to hand the provider.
  */
 function modelsFile() {
-  return modelsFiles.find(existsSync) ?? modelsFiles[modelsFiles.length - 1]
+  return modelsFiles.find(existsSync) ?? modelsFiles[0]
 }
 
 /**
@@ -102,7 +172,7 @@ function modelsFile() {
 function selectionPatch(choice) {
   const dir = join(home, 'launch')
   mkdirSync(dir, { recursive: true })
-  const path = join(dir, 'selection.patch.yml')
+  const path = join(dir, `selection-${process.pid}.patch.yml`)
   writeFileSync(path, [
     '# Generated by App/scripts/run-acp.mjs — the route the next session starts on.',
     '# Edit .harness/models.json (or add a model in the application), not this file:',
@@ -113,10 +183,16 @@ function selectionPatch(choice) {
     `    provider: ${JSON.stringify(choice.provider)}`,
     `    model: ${JSON.stringify(choice.model)}`,
     '',
-    '# The route source follows the workspace, not the launch directory.',
+    '# The route source follows the workspace, not the launch directory. A config',
+    "# override replaces the row's whole config, so every field is restated here —",
+    '# an overlay that named only modelsFile silently dropped the default route.',
     '- id: llm-harness',
     '  config:',
     `    modelsFile: ${JSON.stringify(modelsFile())}`,
+    '    apiKeyEnv: AI_API_KEY',
+    '    defaultRoute: !!js "({ displayName: process.env.AI_MODEL, baseURL: process.env.AI_BASE_URL,'
+      + ' model: process.env.AI_MODEL, contextWindow: Number(process.env.AI_CONTEXT_WINDOW),'
+      + ' maxTokens: Number(process.env.AI_MAX_TOKENS) })"',
     '',
   ].join('\n'))
   return path
@@ -124,10 +200,12 @@ function selectionPatch(choice) {
 
 const choice = selection()
 const patch = selectionPatch(choice)
-if (choice.placeholder) {
-  process.stderr.write('run-acp: no active model in .harness/models.json; sessions open on the built-in'
-    + ' placeholder route and prompts will fail until one is added (the application adds one, or set'
-    + ' AI_HARNESS_FALLBACK_MODEL and AI_HARNESS_FALLBACK_BASE_URL in .env)\n')
+process.on('exit', () => { rmSync(patch, { force: true }) })
+if (choice.provider === 'default') {
+  process.stderr.write(`run-acp: model ${choice.model} at ${route.AI_BASE_URL} (set AI_MODEL / AI_BASE_URL to change it)\n`)
+}
+if (!setting('AI_API_KEY')) {
+  process.stderr.write('run-acp: AI_API_KEY is not set (environment or .env); every prompt will fail until it is\n')
 }
 
 const bin = join(dsh, 'apps', 'cli', 'src', 'bin.ts')
@@ -161,6 +239,8 @@ const child = spawn(process.execPath, args, {
     // resolves the `@deepseek-ai/*` path facade for the plugins it loads.
     TSX_TSCONFIG_PATH: join(dsh, 'tsconfig.json'),
     DSH_HOME: home,
+    ...settings,
+    ...route,
   },
   stdio: 'inherit',
 })
@@ -172,6 +252,10 @@ const child = spawn(process.execPath, args, {
 for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
   process.on(signal, () => { child.kill(signal) })
 }
+child.on('error', error => {
+  process.stderr.write(`run-acp: engine launch failed: ${error.message}\n`)
+  process.exit(1)
+})
 child.on('exit', (code, signal) => {
   if (signal !== null) {
     process.kill(process.pid, signal)

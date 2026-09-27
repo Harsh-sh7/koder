@@ -15,7 +15,7 @@
 
 use std::time::Duration;
 
-use eframe::egui::{self, Frame, Key, Modifiers, RichText, Ui};
+use eframe::egui::{self, Frame, Key, Modifiers, Rect, RichText, Ui, Vec2};
 
 use crate::state::{FocusRequest, HarnessState, Palette, PaletteMode, Pane};
 use crate::theme;
@@ -49,6 +49,8 @@ pub struct HarnessApp {
     fronted: bool,
     /// The workspace the window title was last written for.
     titled: std::path::PathBuf,
+    /// Whether the window has been fitted to its screen yet.
+    fitted: bool,
 }
 
 impl HarnessApp {
@@ -85,6 +87,7 @@ impl HarnessApp {
             asked: false,
             fronted: false,
             titled,
+            fitted: false,
         }
     }
 
@@ -117,10 +120,25 @@ impl HarnessApp {
         if ctx.input_mut(|input| input.consume_key(command_shift, Key::F)) {
             self.open_palette(PaletteMode::Contents);
         }
-        if ctx.input_mut(|input| input.consume_key(command, Key::K))
-            || ctx.input_mut(|input| input.consume_key(command, Key::P))
-        {
+        if ctx.input_mut(|input| input.consume_key(command, Key::K)) {
             self.open_palette(PaletteMode::Commands);
+        }
+        // ⌘P is go-to-file everywhere it is documented (the key card, --help).
+        if ctx.input_mut(|input| input.consume_key(command, Key::P)) {
+            self.open_palette(PaletteMode::Files);
+        }
+        if ctx.input_mut(|input| input.consume_key(command, Key::Backslash)) {
+            self.state.sidebar_open = !self.state.sidebar_open;
+            self.state.save_config();
+        }
+        if ctx.input_mut(|input| input.consume_key(command, Key::N)) {
+            self.state.new_task();
+        }
+        if ctx.input_mut(|input| input.consume_key(command, Key::OpenBracket)) {
+            self.state.navigate(false);
+        }
+        if ctx.input_mut(|input| input.consume_key(command, Key::CloseBracket)) {
+            self.state.navigate(true);
         }
         if ctx.input_mut(|input| input.consume_key(command, Key::B)) {
             self.state.tree_open = !self.state.tree_open;
@@ -149,7 +167,20 @@ impl HarnessApp {
             self.state.open_folder_dialog();
         }
         if ctx.input_mut(|input| input.consume_key(command, Key::W)) {
-            self.state.editor.buffer = None;
+            // Closing must not throw away typing: a dirty buffer stays open
+            // until it is saved, and the toast says how.
+            let dirty = self
+                .state
+                .editor
+                .buffer
+                .as_ref()
+                .is_some_and(|buffer| buffer.dirty());
+            if dirty {
+                self.state
+                    .toast("this file has unsaved changes — ⌘S saves them, then ⌘W closes it");
+            } else {
+                self.state.editor.buffer = None;
+            }
         }
         for (key, pane) in [
             (Key::Num1, Pane::Conversation),
@@ -163,7 +194,12 @@ impl HarnessApp {
                 self.state.go(pane, crate::state::SidebarSpot::Task);
             }
         }
-        if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape)) {
+        // Escape is only taken when there is something here for it to close;
+        // otherwise it belongs to whatever has the keyboard — a shell running
+        // vim or less needs it far more than the chrome does.
+        let closable =
+            self.state.palette.is_some() || self.state.dialog.is_some() || self.state.help_open;
+        if closable && ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape)) {
             if self.state.palette.is_some() {
                 self.state.palette = None;
             } else if self.state.dialog.is_some() {
@@ -205,7 +241,7 @@ impl HarnessApp {
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .default_pos(egui::pos2(ctx.content_rect().center().x - 170.0, 120.0))
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 120.0))
             .show(ctx, |ui| {
                 for (keys, what) in [
                     ("⌘K", "command palette"),
@@ -215,6 +251,9 @@ impl HarnessApp {
                         "⌘1…6",
                         "conversation · terminal · editor · git · workflows · meter",
                     ),
+                    ("⌘N", "new task"),
+                    ("⌘[ ⌘]", "back · forward"),
+                    ("⌘\\", "show or hide the sidebar"),
                     ("⌘T", "new shell"),
                     ("⌘B", "file tree"),
                     ("⌘J", "session panel"),
@@ -239,6 +278,49 @@ impl HarnessApp {
         if !open {
             self.state.help_open = false;
         }
+    }
+
+    /// Shrinks the window to its screen on the first frames, once the monitor's
+    /// size is known.
+    ///
+    /// The window opens at a comfortable default, and on a laptop screen that
+    /// default can be taller or wider than the space the menu bar and dock
+    /// leave — the bottom of the sidebar and the composer then sit off-screen.
+    /// A window larger than 92% of its monitor is resized to 88% and centred.
+    ///
+    /// @param ctx the egui context
+    fn fit_to_screen(&mut self, ctx: &egui::Context) {
+        if self.fitted {
+            return;
+        }
+        let (monitor, inner) = ctx.input(|input| {
+            let viewport = input.viewport();
+            (viewport.monitor_size, viewport.inner_rect)
+        });
+        let (Some(monitor), Some(inner)) = (monitor, inner) else {
+            if self.opened.elapsed() > Duration::from_secs(2) {
+                self.fitted = true;
+            }
+            return;
+        };
+        self.fitted = true;
+        if monitor.x <= 0.0 || monitor.y <= 0.0 {
+            return;
+        }
+        let too_wide = inner.width() > monitor.x * 0.92;
+        let too_tall = inner.height() > monitor.y * 0.92;
+        if !too_wide && !too_tall {
+            return;
+        }
+        let size = egui::vec2(
+            inner.width().min(monitor.x * 0.88),
+            inner.height().min(monitor.y * 0.88),
+        );
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+            (monitor.x - size.x) / 2.0,
+            ((monitor.y - size.y) / 2.0).max(28.0),
+        )));
     }
 
     /// Takes the requested screenshot, once the interface has settled.
@@ -332,8 +414,15 @@ impl eframe::App for HarnessApp {
         }
     }
 
+    fn on_exit(&mut self) {
+        // The task in flight is history like any other: quitting keeps it.
+        self.state.save_task();
+        self.state.save_config();
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.fit_to_screen(&ctx);
         self.keys(&ctx);
 
         // The window names the folder it is working in, so a folder switch has to
@@ -344,24 +433,45 @@ impl eframe::App for HarnessApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
         }
 
-        egui::Panel::left("harness-sidebar")
-            .exact_size(theme::SIDEBAR)
-            .frame(sidebar_frame())
-            .show(ui, |ui| shell::sidebar(&mut self.state, ui));
+        // Every column is sized from the window, so a narrow window folds the
+        // chrome (an icon rail, a floating session panel) instead of crushing
+        // the conversation card between two fixed-width columns.
+        let columns = theme::columns(ctx.content_rect().width());
+        // Expanding and retracting are animated: the sidebar's width eases
+        // between zero and its column, so the cards slide rather than jump.
+        let open = ctx.animate_bool_with_time(
+            egui::Id::new("sidebar-open"),
+            self.state.sidebar_open,
+            0.16,
+        );
+        let sidebar_width = (columns.sidebar * open).round();
+        if sidebar_width >= 1.0 {
+            egui::Panel::left("harness-sidebar")
+                .exact_size(sidebar_width)
+                .resizable(false)
+                .frame(sidebar_frame())
+                .show(ui, |ui| {
+                    // Laid out at full width and clipped, so the rows slide in
+                    // whole instead of re-wrapping at every width in between.
+                    let full = Rect::from_min_size(ui.max_rect().min, Vec2::new(columns.sidebar, ui.max_rect().height()));
+                    ui.set_clip_rect(ui.max_rect());
+                    crate::theme::inside(ui, full, |ui| shell::sidebar(&mut self.state, ui, columns.rail));
+                });
+        }
 
         // The tree is a column of the workspace rather than part of the chrome,
         // so it appears only when it is asked for and never moves the cards.
         if self.state.tree_open {
             egui::Panel::left("harness-tree")
-                .default_size(246.0)
-                .size_range(160.0..=460.0)
+                .default_size(246.0_f32.min(columns.tree_max))
+                .size_range(160.0..=columns.tree_max)
                 .frame(tree_frame())
                 .show(ui, |ui| panes::tree::show(&mut self.state, ui));
         }
 
         egui::CentralPanel::default()
             .frame(workspace_frame())
-            .show(ui, |ui| shell::workspace(&mut self.state, ui));
+            .show(ui, |ui| shell::workspace(&mut self.state, ui, columns.panel));
 
         palette::show(&mut self.state, &ctx);
         dialogs::show(&mut self.state, &ctx);

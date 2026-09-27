@@ -125,19 +125,27 @@ dsh bundle layer applied after the base and ACP bundles. It does two things:
 1. **Route ownership.** Every shipped DeepSeek route is mounted `disabled: true`,
    and `@harness/dsh-llm-harness-provider` is mounted as the only route source,
    reading the workspace document `.harness/models.json` and the environment
-   variable `AI_API_KEY`. The composition ships **no model**; a model is added in
-   the application, which is the only way a route appears. With nothing declared
-   anywhere, the provider still serves one built-in placeholder route
-   (`unconfigured`, "No model configured") so `session/new` — which names a route
-   — keeps working on a workspace nobody has configured; the placeholder cannot
-   complete a request, which is what keeps "ships no model" true.
-   (`AI_HARNESS_FALLBACK_MODEL` + `AI_HARNESS_FALLBACK_BASE_URL` — both or
-   neither — exist for headless deployments that cannot configure a workspace.)
+   variable `AI_API_KEY`. The composition declares one default route —
+   OpenRouter's DeepSeek, replaced by `AI_MODEL`/`AI_BASE_URL` from the
+   environment or `.env` — and a workspace's `.harness/models.json` `active`
+   entry wins over it. The launcher's overlay restates the provider row's whole
+   config (a Cordis override replaces an entry's config wholesale, which is how
+   an overlay naming only `modelsFile` once dropped the fallback route).
 2. **The harness itself**: `@harness/dsh-spec-lock` (the incoming issue is frozen
    at session start, restated whenever context management drops it, amendable only
    with user approval), plus the preset's own contract, wave/committee tools, and
    budget cap (defaults in `cordis.yml`, overridable from a profile patch or
    overlay without editing source).
+
+**Self-check (`harness_report`, `src/review.ts`).** A read-only tool the model
+can call before reporting a multi-part job done: it turns the same numbers the
+budget listener and `run_wave` already track — weighted token spend, step count,
+escalations used, and every part's outcome, each against its live ceiling —
+into a short, evidence-bound findings list (severities `high`/`medium`/`low`,
+worst first). It changes nothing and reads no new state; it exists so a model
+(or a person reading the transcript) can answer "is this turn actually within
+bounds?" from evidence instead of a guess, the way an external harness auditor
+would score a run after the fact, but for free and inside the same turn.
 
 **Token minimization is designed in, not tuned later:**
 
@@ -189,14 +197,14 @@ own agent loop — there is exactly one, in the engine.
   interpreter; `HARNESS_NODE_VERSION` forces the download path.)
 - `make run` — `run-acp.mjs` starts the engine as an ACP server on stdio,
   workspace at the repo root, with the session's starting route patched in from,
-  in order: the document's `active` entry, the deployment fallback
-  (`AI_HARNESS_FALLBACK_MODEL`/`_BASE_URL`), or the provider's built-in
-  placeholder route. The acp row's shipped default names a provider this
-  composition disables, so a launch that patched nothing could not open a
-  session at all. It comes up and stays up; the issue arrives as a
-  `session/prompt` on the running process. A no-model launch says so on stderr
-  and starts anyway — sessions open on the placeholder, which cannot complete a
-  request.
+  in order: the document's `active` entry, then the default route (`AI_MODEL`
+  at `AI_BASE_URL`, OpenRouter's DeepSeek when unset). It reads `AI_*` settings
+  from the repository's and the workspace's `.env` into the engine's
+  environment, prints the model it starts on, and warns when `AI_API_KEY` is
+  missing. The acp row's shipped default names a provider this composition
+  disables, so a launch that patched nothing could not open a session at all.
+  It comes up and stays up; the issue arrives as a `session/prompt` on the
+  running process.
 - The workspace the agent works in travels separately from the launch directory:
   the client names it in `session/new` `cwd`, and `run-acp.mjs` reads
   `HARNESS_WORKSPACE` (which the app sets) to know whose route document to read.

@@ -31,6 +31,7 @@ import type {} from '@deepseek-ai/dsh-user-approval'
 import {
   DEFAULT_MAX_INLINE_CHARS,
   DEFAULT_MIN_CHARS,
+  DEFAULT_REFREEZE_MIN_CHARS,
   SPEC_LOCK_SOURCE,
   digestOf,
   restateSpec,
@@ -42,6 +43,7 @@ import type { SpecLockState } from './spec.ts'
 export {
   DEFAULT_MAX_INLINE_CHARS,
   DEFAULT_MIN_CHARS,
+  DEFAULT_REFREEZE_MIN_CHARS,
   SPEC_LOCK_SOURCE,
   applySpecLockEvent,
   digestOf,
@@ -64,12 +66,18 @@ export interface Config {
   maxInlineChars?: number
   /** Shortest text a message may freeze as the spec with. Defaults to 1. */
   minChars?: number
+  /**
+   * Shortest later user prompt that is a new task and re-freezes the spec.
+   * Defaults to 80; 0 keeps the first spec for the whole session.
+   */
+  refreezeMinChars?: number
 }
 
 /** Runtime schema for {@link Config}. */
 export const Config: z<Config> = z.object({
   maxInlineChars: z.number().step(1).min(1).default(DEFAULT_MAX_INLINE_CHARS),
   minChars: z.number().step(1).min(1).default(DEFAULT_MIN_CHARS),
+  refreezeMinChars: z.number().step(1).min(0).default(DEFAULT_REFREEZE_MIN_CHARS),
 })
 
 /** The model-facing read tool. */
@@ -77,7 +85,7 @@ export const SPEC_GET = 'spec_get'
 /** The approval-gated write tool. */
 export const SPEC_AMEND = 'spec_amend'
 
-const GET_DESCRIPTION = 'Read this session\'s frozen spec: the opening instruction kept authoritative across'
+const GET_DESCRIPTION = 'Read this session\'s frozen spec: the current task\'s instruction, kept authoritative across'
   + ' context compaction. Call it when the spec has left the visible history, or before work that must comply with it.'
 
 const AMEND_DESCRIPTION = 'Replace this session\'s frozen spec, after the user approves the change. Call it only when'
@@ -91,7 +99,8 @@ const AMEND_DESCRIPTION = 'Replace this session\'s frozen spec, after the user a
 export function apply(ctx: Context, config: Config): void {
   const minChars = config.minChars ?? DEFAULT_MIN_CHARS
   const maxInlineChars = config.maxInlineChars ?? DEFAULT_MAX_INLINE_CHARS
-  ctx.sessionProjections.register(specLockProjection(minChars))
+  const refreeze = config.refreezeMinChars ?? DEFAULT_REFREEZE_MIN_CHARS
+  ctx.sessionProjections.register(specLockProjection(minChars, refreeze > 0 ? refreeze : undefined))
 
   /** The fold state of one session; the projection is registered by this plugin. */
   const stateOf = (session: Session): SpecLockState => {

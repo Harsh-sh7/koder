@@ -60,6 +60,18 @@ function assertNoUnknownKeys(path: string, value: Record<string, unknown>, allow
   throw new ModelsDocumentError(path, `unknown field${unknown.length > 1 ? 's' : ''} ${unknown.join(', ')}; known fields are ${allowedList}`)
 }
 
+/** Validate endpoint syntax without including potentially secret input in errors. */
+export function validateBaseURL(value: unknown): void {
+  const invalid = 'baseURL must be an absolute http:// or https:// URL with a host'
+  if (typeof value !== 'string' || /\s/u.test(value) || !/^https?:\/\//u.test(value)) throw new Error(invalid)
+  let url: URL
+  try { url = new URL(value) } catch { throw new Error(invalid) }
+  if (!url.hostname) throw new Error(invalid)
+  if (url.username || url.password || url.search || url.hash) {
+    throw new Error('baseURL must not contain credentials, a query, or a fragment; use apiKeyEnv for the key')
+  }
+}
+
 /**
  * Validate one route profile without reimplementing profile semantics:
  * structure and field names are checked here so a typo names its line, and
@@ -78,6 +90,11 @@ function assertRoute(path: string, route: string, value: unknown): void {
   const where = `providers.${route}`
   if (!isRecord(value)) throw new ModelsDocumentError(path, `${where} must be an object`)
   assertNoUnknownKeys(path, value, ROUTE_FIELDS)
+  if (value.baseURL !== undefined) {
+    try { validateBaseURL(value.baseURL) } catch (error) {
+      throw new ModelsDocumentError(path, `${where}: ${(error as Error).message}`)
+    }
+  }
   if (value.models !== undefined && !Array.isArray(value.models)) {
     throw new ModelsDocumentError(path, `${where}.models must be an array`)
   }
@@ -108,6 +125,9 @@ export function parseModelsDocument(raw: unknown, path: string): ModelsDocument 
   if (!isRecord(raw)) throw new ModelsDocumentError(path, 'the document must be a JSON object')
   const unknown = Object.keys(raw).filter(key => key !== 'providers' && key !== 'active')
   if (unknown.length > 0) throw new ModelsDocumentError(path, `unknown top-level field ${unknown.join(', ')}; expected providers and active`)
+  if (raw.providers !== undefined && !isRecord(raw.providers)) {
+    throw new ModelsDocumentError(path, 'providers must be an object')
+  }
   const providers: Record<string, PiAiProviderProfile> = {}
   for (const [route, value] of Object.entries(raw.providers ?? {})) {
     if (route.length === 0) throw new ModelsDocumentError(path, 'provider route names must be non-empty')

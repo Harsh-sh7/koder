@@ -1,7 +1,7 @@
 # AI Harness
 
-A terminal-first coding harness: a native desktop application over the
-`deepseek-harness` (dsh) agent engine. The issue is frozen at session start,
+A terminal-first coding harness: a native desktop application over a vendored,
+plugin-based agent engine. The issue is frozen at session start,
 decomposed into parallel waves, executed through real shell commands, and every
 iteration has to end in a real pass/fail signal — the project's tests, or a
 reviewing committee when there are none. Token budgets are enforced by the
@@ -32,10 +32,15 @@ harness, not requested from the model. Nothing is written into the vendored
 ## Run
 
 ```sh
-cp .env.example .env      # then put your key in AI_API_KEY
-make setup                # toolchains check, substrate install, plugin install, profile
+cp .env.example .env      # then put your key in AI_API_KEY (and AI_MODEL, if not the default)
+make setup                # toolchains check, substrate install + build, plugin install, profile
 make run                  # the engine comes up as an ACP server and stays up
 ```
+
+`make setup` also builds the parts of the dsh checkout a session needs (its
+native addon and host library bundles — dsh's own README requires `pnpm run
+build` after install). The first run takes about two minutes and needs a C
+compiler (Xcode command-line tools on macOS); re-runs take seconds.
 
 `make run` launches and listens; the issue is supplied afterwards to the running
 process (an ACP `session/prompt`), not as a launch argument.
@@ -66,18 +71,55 @@ provider said in one sentence, and a row under it offers **try again** on the sa
 route or a jump to the route dialog. A rate-limited free route (429), a rejected
 key (401), and a wrong base URL (404) each name their own repair.
 
-## Adding a model
+**Task history.** Every task is kept in `<workspace>/.harness/tasks/` from its
+first prompt — transcript, name, and the engine session it ran in — and listed
+under the workspace in the sidebar, newest first. Opening one restores its
+transcript and resumes its engine session (`session/resume`), so a follow-up
+continues with the model's full context. A task's `⋯` (or a right click) renames
+or deletes it; the clock beside your name lists recent ones.
 
-The composition ships **no model**. A route appears when one is added — in the
-application's model dialog, or by writing the workspace document
-`.harness/models.json` — and the route a session starts on is that document's
-`active` entry. The dialog's `api key` field takes the credential's value and
-writes it to the workspace `.env` (gitignored); the route document records only
-the variable's name, so a key never lands in a file that gets committed. Until a
-route is added, sessions still open: they run on the provider's built-in
-placeholder route ("No model configured"), whose requests fail at once, so an
-ACP client attached to `make run` on a fresh clone gets a session and a clear
-"add a model" instead of an engine error. Model configuration lives in exactly
+**Chrome.** The window draws its own title bar: the traffic lights sit in the
+sidebar's corner beside the sidebar toggle (`⌘\`) and back / forward (`⌘[` `⌘]`),
+which walk the tasks and views you visited. The sidebar slides away and back; in
+a narrow window it folds to an icon rail and the session panel floats over the
+card. The title row carries the view picker, quick actions (`⌘K`), and the file
+tree, terminal, and session-panel toggles. `⌘N` starts a new task.
+
+**The session panel** lists the task's **Subagents** — each part `run_wave` runs,
+with its state, and a stop — the **Skills & MCP** a session can use (skills from
+`.dsh/skills`, `.agents/skills`, and the user's skill folders; MCP servers from
+`.harness/mcp.json`, passed to every new session), the **Artifact** files the task
+created or changed, and its **Processes**.
+
+**Answers** render as markdown — headings, lists, tables, quotes, inline code —
+with fenced blocks drawn verbatim: syntax-highlighted, never wrapped, scrolling
+sideways, folded when long, with a copy button, so ASCII and mermaid diagrams
+keep every column.
+
+## Choosing the model
+
+A clean clone runs with nothing but `AI_API_KEY`: the default route is
+OpenRouter's DeepSeek (`deepseek/deepseek-v4-flash` at
+`https://openrouter.ai/api/v1`). Another model is one line in `.env` (or the
+environment) — no source change:
+
+```sh
+AI_MODEL=qwen/qwen3.7-plus            # any OpenAI-compatible model id
+AI_BASE_URL=https://openrouter.ai/api/v1
+AI_CONTEXT_WINDOW=131072              # the working context compaction keeps within
+AI_MAX_TOKENS=8192                    # output tokens one response may use; raise it only
+                                       # if your route allows more (Groq, among others,
+                                       # rejects a request above its own smaller per-model
+                                       # ceiling even when it is under the context window)
+AI_TEMPERATURE=0.2                    # optional; unset uses the route's default
+```
+
+`make run` prints the model and endpoint it starts on. A workspace can also
+declare routes in `.harness/models.json` — the application's model dialog
+writes it — and that document's `active` entry wins over the default. The
+dialog's `api key` field writes the credential's value to the workspace `.env`
+(gitignored); the route document records only the variable's name, so a key
+never lands in a file that gets committed. Model configuration lives in exactly
 one file, `App/dsh-plugins/hackathon-harness-preset/cordis.yml`, and every value
 in it is overridable from a profile patch or overlay without editing source.
 
@@ -87,7 +129,7 @@ in it is overridable from a profile patch or overlay without editing source.
 |---|---|
 | `Makefile` | the standardised interface: `setup` `run` `app` `test` `typecheck` `check` `check-native` `check-engine` `clean` |
 | `App/native/` | the application — `harness-core` (PTY terminal with blocks, git, files, search, ACP client, session model, token accounting) and `harness-app` (the egui interface) |
-| `App/dsh-plugins/` | the composition — the `AI_API_KEY` route provider, the spec lock, and the harness preset (contract, waves, committee, budget cap) |
+| `App/dsh-plugins/` | the composition — the `AI_API_KEY` route provider, the spec lock, and the harness preset (contract, `run_wave` parallel subagents, `wave_plan`, committee, budget cap) |
 | `App/scripts/` | `init-profile.mjs` (materializes the dsh profile), `run-acp.mjs` (`make run`), and the node/pnpm provisioning (`node-bin.sh`, `provision-node.sh`, `with-node.sh`) |
 | `App/probe/` | handshake probes, including the deterministic mock model server |
 
@@ -135,7 +177,9 @@ window while the shot is pending and never takes focus); `--pane` opens straight
 into a view; `--dialog models` opens straight into the model dialog; `--ask`
 sends a prompt at launch; `--check` is the headless self-test. `mock-openai.mjs`
 modes: default text replies, `--tool` (tool calls), `--spec` (a spec round),
-`--wave` (a plan plus subagents), `--panel` (a task list twice, a `subagent`
+`--wave` (a plan plus subagents), `--build` (a `run_wave` of three parallel
+parts, each child writing its own file, then a markdown answer with a table,
+code, a mermaid block and an ASCII diagram), `--panel` (a task list twice, a `subagent`
 delegation, a created file, an `edit` of it, and a command held open — every card
 the transcript and the session panel can draw, with live rows).
 

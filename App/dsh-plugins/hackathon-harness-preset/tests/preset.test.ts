@@ -26,7 +26,7 @@ import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 
 import * as harnessPreset from '../src/index.ts'
-import { BUDGET_TOOL, COMMITTEE, CONTRACT_SECTION, ORCHESTRATION_SKILL, WAVE_PLAN, contractText } from '../src/index.ts'
+import { BUDGET_TOOL, COMMITTEE, CONTRACT_SECTION, HARNESS_REPORT, ORCHESTRATION_SKILL, RUN_WAVE, WAVE_PLAN, contractText } from '../src/index.ts'
 import type { Config } from '../src/index.ts'
 
 /** The mutable spend the fake token-usage projection serves, bucket by bucket. */
@@ -76,13 +76,13 @@ async function harness(config: Config = {}, approval?: 'allowed-once' | 'rejecte
   const agent = { session } as unknown as Agent
   const claimed = (): UserMessage[] => [createUserMessage({ content: [{ type: 'text', text: 'build the thing' }], source: { kind: 'user' } })]
   /** One proposed step, driven through the waterfall exactly as the loop drives it. */
-  const step = (stepNumber = 1, messages: UserMessage[] = claimed()): Promise<PreStepDecision> =>
+  const step = (stepNumber = 1, messages: UserMessage[] = claimed(), turn = 1): Promise<PreStepDecision> =>
     ctx.waterfall(
       'agent/pre-step',
-      { agent, messages, turn: 1, step: stepNumber, signal: new AbortController().signal },
+      { agent, messages, turn, step: stepNumber, signal: new AbortController().signal },
       () => Promise.resolve<PreStepDecision>({ kind: 'enter', messages }),
     )
-  return { ctx, spend, skills, asked, step }
+  return { ctx, spend, skills, asked, step, session, agent }
 }
 
 /** The messages of an admitting decision, failing the test when the harness rejected the step. */
@@ -106,6 +106,27 @@ test('the operating contract rides every request as constant text', async () => 
   // which is why no live number (spend, ceiling, step) may reach it.
   const next = await ctx.systemPrompt.assemble()
   assert.equal(next.sections.find(candidate => candidate.name === CONTRACT_SECTION)?.text, section.text)
+})
+
+test('delegation is an unconditional rule the model reaches before writing any file, not a judgement call', async () => {
+  // Regression pin: a request like "a todo CLI with tests and a README" reads
+  // as one small task to a weak model, so a rule buried near the end of the
+  // contract ("...when a job has two or more parts...") was reliably skipped —
+  // the model just wrote every file itself, serially, no run_wave, no
+  // subagents. The fix is textual and has to keep two properties: the rule
+  // rides EARLY (models weight earlier instructions more) and its trigger is
+  // CONCRETE ("an implementation plus its tests is already two parts") rather
+  // than a judgement call the model has to first decide applies to it.
+  const text = contractText()
+  const lines = text.split('\n')
+  const delegate = lines.findIndex(line => /\brun_wave\b/u.test(line) && /\bcall\b/iu.test(line))
+  assert.ok(delegate !== -1, 'a rule must instruct calling run_wave')
+  // Earlier than halfway through the numbered rules: this is what makes it
+  // reliably followed rather than merely present somewhere in the prompt.
+  assert.ok(delegate <= lines.length / 2, `run_wave rule at line ${delegate} of ${lines.length} is not early enough`)
+  assert.match(text, /implementation.{0,40}tests.{0,80}already (two|2) parts/iu)
+  assert.match(text, /however small or simple the task reads/u)
+  assert.match(text, /do not (write|ask)/u)
 })
 
 test('the two tools declare the parameters the contract depends on', async () => {
@@ -138,7 +159,7 @@ test('the orchestration skill ships with the plugin and loads on demand', async 
 })
 
 test('the budget warns once per ceiling, not once per step', async () => {
-  const { spend, step } = await harness({ maxTokens: 1_000, warnAt: 0.8, stepsPerTurn: 50 })
+  const { spend, step } = await harness({ maxTokens: 1_000, warnAt: 0.8, stepsPerTurn: 50, budgetScope: 'session' })
   spend.uncachedInputTokens = 800
   const warned = admitted(await step(2))
   assert.deepEqual(texts(warned).slice(-1), [
@@ -151,14 +172,17 @@ test('the budget warns once per ceiling, not once per step', async () => {
 })
 
 test('an exhausted budget stops the turn when nobody can be asked', async () => {
-  const { spend, asked, step } = await harness({ maxTokens: 1_000 })
+  const { spend, asked, step } = await harness({ maxTokens: 1_000, budgetScope: 'session' })
   spend.outputTokens = 1_000
   assert.deepEqual(await step(2), { kind: 'reject' })
   assert.deepEqual(asked, [])
 })
 
 test('an approved escalation raises the ceiling and admits the step', async () => {
-  const { spend, asked, step } = await harness({ maxTokens: 1_000, grantTokens: 500, maxEscalations: 2 }, 'allowed-once')
+  const { spend, asked, step } = await harness(
+    { maxTokens: 1_000, grantTokens: 500, maxEscalations: 2, budgetScope: 'session' },
+    'allowed-once',
+  )
   spend.outputTokens = 1_000
   const granted = admitted(await step(2))
   assert.equal(granted.length, 1)
@@ -167,4 +191,317 @@ test('an approved escalation raises the ceiling and admits the step', async () =
   // The grant is real: the same spend now sits under the raised ceiling, so the
   // next step is admitted without a warning.
   assert.equal(admitted(await step(3)).length, 1)
+})
+
+test('a turn-scoped budget gives every prompt its own ceiling', async () => {
+  const { spend, step } = await harness({ maxTokens: 1_000, stepsPerTurn: 50 })
+  // The first issue spends almost everything and is still admitted.
+  assert.equal(admitted(await step(1, undefined, 1)).length, 1)
+  spend.outputTokens = 990
+  assert.equal(admitted(await step(2, undefined, 1)).length, 2, 'the first turn is warned at its own 80%')
+  // The next prompt starts from zero: the last issue's spend is not its debt.
+  assert.equal(admitted(await step(1, undefined, 2)).length, 1)
+  spend.outputTokens = 990 + 700
+  assert.equal(admitted(await step(2, undefined, 2)).length, 1)
+  spend.outputTokens = 990 + 1_000
+  assert.deepEqual(await step(3, undefined, 2), { kind: 'reject' })
+})
+
+test('prompt-cache reads count at their weight against the ceiling', async () => {
+  const { spend, step } = await harness({ maxTokens: 1_000, stepsPerTurn: 50, budgetScope: 'session' })
+  // Nine thousand cached tokens at the default weight of 0.1 are 900: warned, not stopped.
+  spend.cacheReadTokens = 9_000
+  const warned = admitted(await step(2))
+  assert.match(texts(warned).at(-1) ?? '', /Harness budget: 90% spent/u)
+})
+
+test('the step cap warns before it stops, and a grant on it buys steps, not tokens', async () => {
+  const { asked, step } = await harness({ stepsPerTurn: 4, warnAt: 0.5, maxEscalations: 1 }, 'allowed-once')
+  assert.match(texts(admitted(await step(2))).at(-1) ?? '', /step 2 of a 4-step turn\. Converge now/u)
+  // Warned once per turn.
+  assert.equal(admitted(await step(3)).length, 1)
+  // Step 5 is over the cap: the grant adds half the cap again, so steps 5 and 6 run.
+  assert.ok(admitted(await step(5)).length >= 1)
+  assert.match(asked[0]?.reason ?? '', /Grant 2 more steps \(escalation 1 of 1\)\?/u)
+  assert.ok(admitted(await step(6)).length >= 1)
+  // The only escalation is spent, so the next overrun ends the turn.
+  assert.deepEqual(await step(7), { kind: 'reject' })
+})
+
+test('a configured temperature reaches the request header unless the request set its own', async () => {
+  const { ctx } = await harness({ temperature: 0.2 })
+  const request = (seed: { provider: string; model: string; temperature?: number }) => ctx.waterfall(
+    'agent/request',
+    { agent: {} as Agent, turn: 1, step: 1, signal: new AbortController().signal },
+    () => Promise.resolve(seed),
+  )
+  assert.equal((await request({ provider: 'p', model: 'm' })).temperature, 0.2)
+  assert.equal((await request({ provider: 'p', model: 'm', temperature: 0.9 })).temperature, 0.9)
+})
+
+test('run_wave seats every part of a wave at once, runs overlapping parts later, and returns each result', async () => {
+  // The real stagger between starts is a deliberate, small wall-clock delay
+  // (softening a burst against a rate-limited route); zeroing it here keeps
+  // this test fast and deterministic without weakening what it proves.
+  const { ctx } = await harness({ partStartStaggerMs: 0 })
+  const started: { label: string; wave: number }[] = []
+  let wave = 1
+  let live = 0
+  let peak = 0
+  ctx.provide('subagents', {
+    start: async (_provider: string, request: { label: string; prompt: { text: string }[] }) => {
+      started.push({ label: request.label, wave })
+      live += 1
+      peak = Math.max(peak, live)
+      const id = `child-${request.label}`
+      return {
+        id,
+        localAgent: undefined,
+        result: (async () => {
+          await new Promise(resolve => setTimeout(resolve, 5))
+          live -= 1
+          if (live === 0) wave += 1
+          return request.label.endsWith(':docs')
+            ? { output: [], stopReason: 'completed', structured: { status: 'failed', summary: 'blocked on the name.' } }
+            : { output: [], stopReason: 'completed', structured: { status: 'done', summary: `${request.label} ok.` } }
+        })(),
+        dispose: async () => {},
+      }
+    },
+  } as never)
+  const tool = ctx.tools.get(RUN_WAVE)
+  assert.ok(tool !== undefined, 'run_wave must be callable in a session')
+  const session = ctx.sessions.create(SessionId('waves'))
+  const value = await tool.execute({
+    parts: [
+      { id: 'core', task: 'Write the CLI.', files: ['todo.py'], check: 'python todo.py list' },
+      { id: 'tests', task: 'Write tests.', files: ['test_todo.py'], check: 'pytest -q' },
+      { id: 'docs', task: 'Write the README.', files: ['README.md'] },
+      { id: 'polish', task: 'Add --help text.', files: ['todo.py'] },
+    ],
+  }, { agent: { session } as unknown as Agent, signal: new AbortController().signal } as never) as {
+    waves: number
+    parts: { id: string; wave: number; status: string }[]
+  }
+  // Three disjoint parts share wave 1 and ran together; the part that shares
+  // todo.py waited for wave 2.
+  assert.equal(value.waves, 2)
+  assert.equal(peak, 3)
+  assert.deepEqual(started.map(entry => [entry.label, entry.wave]), [
+    ['run_wave:core', 1], ['run_wave:tests', 1], ['run_wave:docs', 1], ['run_wave:polish', 2],
+  ])
+  assert.deepEqual(value.parts.map(part => [part.id, part.wave, part.status]), [
+    ['core', 1, 'done'], ['tests', 1, 'done'], ['docs', 1, 'failed'], ['polish', 2, 'done'],
+  ])
+})
+
+test('a run_wave child may write its own files and is refused any other', async () => {
+  const { ctx } = await harness()
+  let release: (() => void) | undefined
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  ctx.provide('subagents', {
+    start: async () => ({
+      id: 'child-core',
+      localAgent: undefined,
+      result: gate.then(() => ({ output: [], stopReason: 'completed', structured: { status: 'done', summary: 'ok' } })),
+      dispose: async () => {},
+    }),
+  } as never)
+  const tool = ctx.tools.get(RUN_WAVE)
+  assert.ok(tool !== undefined)
+  const parent = ctx.sessions.create(SessionId('parent'))
+  const running = tool.execute(
+    { parts: [{ id: 'core', task: 'Write the CLI.', files: ['src/todo.py'] }] },
+    { agent: { session: parent } as unknown as Agent, signal: new AbortController().signal } as never,
+  )
+  await new Promise(resolve => setTimeout(resolve, 5))
+  const child = { session: { id: 'child-core', header: { cwd: '/work' } } } as unknown as Agent
+  const decide = (file: string) => ctx.waterfall(
+    'tools/pre-execute',
+    { name: 'write', arguments: { file_path: file, content: '' }, agent: child } as never,
+    () => Promise.resolve({ kind: 'allow' as const }),
+  )
+  assert.deepEqual(await decide('src/todo.py'), { kind: 'allow' })
+  const refused = await decide('README.md') as { kind: string; reason?: string }
+  assert.equal(refused.kind, 'deny')
+  assert.match(refused.reason ?? '', /owns src\/todo\.py; README\.md is another part's/u)
+  release?.()
+  await running
+  // Once the part settles, its child's writes are no longer the harness's business.
+  assert.deepEqual(await decide('README.md'), { kind: 'allow' })
+})
+
+
+test('cancelled waves report every skipped part without starting children', async () => {
+  const { ctx } = await harness()
+  ctx.provide('subagents', { start: async () => { throw new Error('must not start') } } as never)
+  const tool = ctx.tools.get(RUN_WAVE)!
+  const session = ctx.sessions.create(SessionId('cancelled-waves'))
+  const abort = new AbortController()
+  abort.abort()
+  const value = await tool.execute({ parts: [
+    { id: 'a', task: 'First', files: ['same'] },
+    { id: 'b', task: 'Second', files: ['same'] },
+  ] }, { agent: { session } as unknown as Agent, signal: abort.signal } as never) as {
+    waves: number; parts: { status: string; summary: string }[]
+  }
+  assert.equal(value.waves, 0)
+  assert.equal(value.parts.length, 2)
+  for (const part of value.parts) {
+    assert.equal(part.status, 'failed')
+    assert.match(part.summary, /Cancelled before/u)
+  }
+})
+
+test('a part whose model request fails without completing is retried once before being reported failed', async () => {
+  // This is the real bug behind three simultaneous parts all reporting the
+  // bare word "error": a route that is shared across a wave's parallel starts
+  // can throttle one of them transiently — the part's task was never the
+  // problem, the burst against the route was. One retry, and a message that
+  // says so, is the fix; a part that completed and genuinely reported failed
+  // through structured_output must NOT be retried (that is a real verdict).
+  const { ctx } = await harness({ partStartStaggerMs: 0 })
+  const attempts = new Map<string, number>()
+  ctx.provide('subagents', {
+    start: async (_provider: string, request: { label: string }) => {
+      const part = request.label.split(':')[1] ?? request.label
+      const attempt = (attempts.get(part) ?? 0) + 1
+      attempts.set(part, attempt)
+      if (part === 'flaky' && attempt === 1) {
+        return {
+          id: `child-${part}-${attempt}`,
+          localAgent: undefined,
+          result: Promise.resolve({ output: [], stopReason: 'error' }),
+          dispose: async () => {},
+        }
+      }
+      if (part === 'wrong') {
+        return {
+          id: `child-${part}-${attempt}`,
+          localAgent: undefined,
+          result: Promise.resolve({
+            output: [],
+            stopReason: 'completed',
+            structured: { status: 'failed', summary: 'the file the task named does not exist.' },
+          }),
+          dispose: async () => {},
+        }
+      }
+      return {
+        id: `child-${part}-${attempt}`,
+        localAgent: undefined,
+        result: Promise.resolve({
+          output: [],
+          stopReason: 'completed',
+          structured: { status: 'done', summary: `${part} ok on attempt ${attempt}.` },
+        }),
+        dispose: async () => {},
+      }
+    },
+  } as never)
+  const tool = ctx.tools.get(RUN_WAVE)
+  assert.ok(tool !== undefined)
+  const session = ctx.sessions.create(SessionId('retry'))
+  const value = await tool.execute({
+    parts: [
+      { id: 'flaky', task: 'Write the core module.', files: ['core.py'] },
+      { id: 'wrong', task: 'Write a file that cannot exist.', files: ['nope.py'] },
+    ],
+  }, { agent: { session } as unknown as Agent, signal: new AbortController().signal } as never) as {
+    parts: { id: string; status: string; summary: string }[]
+  }
+  assert.equal(attempts.get('flaky'), 2, 'the transient failure earns exactly one retry')
+  assert.equal(attempts.get('wrong'), 1, 'a real reported failure is never retried')
+  const flaky = value.parts.find(part => part.id === 'flaky')
+  assert.equal(flaky?.status, 'done')
+  assert.match(flaky?.summary ?? '', /attempt 2/u)
+  const wrong = value.parts.find(part => part.id === 'wrong')
+  assert.equal(wrong?.status, 'failed')
+  assert.match(wrong?.summary ?? '', /does not exist/u)
+})
+
+test('a part still failing after its retry names the likely cause instead of the bare word "error"', async () => {
+  const { ctx } = await harness({ partStartStaggerMs: 0 })
+  ctx.provide('subagents', {
+    start: async () => ({
+      id: 'child-stuck',
+      localAgent: undefined,
+      result: Promise.resolve({ output: [], stopReason: 'error' }),
+      dispose: async () => {},
+    }),
+  } as never)
+  const tool = ctx.tools.get(RUN_WAVE)
+  assert.ok(tool !== undefined)
+  const session = ctx.sessions.create(SessionId('stuck'))
+  const value = await tool.execute({
+    parts: [{ id: 'core', task: 'Write the core module.', files: ['core.py'] }],
+  }, { agent: { session } as unknown as Agent, signal: new AbortController().signal } as never) as {
+    parts: { id: string; status: string; summary: string }[]
+  }
+  const part = value.parts[0]
+  assert.equal(part?.status, 'failed')
+  assert.notEqual(part?.summary, 'error', 'the bare stopReason alone helps nobody')
+  assert.match(part?.summary ?? '', /retry/u)
+  assert.match(part?.summary ?? '', /rate limit|throttle/u)
+})
+
+test('harness_report reads the same budget the pre-step listener enforces, before any run_wave', async () => {
+  const { ctx, spend, step, session } = await harness({ maxTokens: 1_000, stepsPerTurn: 10, cacheReadWeight: 1 })
+  await step(3)
+  spend.uncachedInputTokens = 250
+  const tool = ctx.tools.get(HARNESS_REPORT)
+  assert.ok(tool !== undefined, 'harness_report must be registered')
+  const value = await tool.execute({}, { agent: { session } as unknown as Agent, signal: new AbortController().signal } as never) as {
+    budget: { tokensSpent: number; tokensLimit: number; stepsUsed: number; stepsLimit: number }
+    waveRuns: { total: number; failed: number }
+    findings: { severity: string; summary: string }[]
+  }
+  assert.equal(value.budget.tokensSpent, 250)
+  assert.equal(value.budget.tokensLimit, 1_000)
+  assert.equal(value.budget.stepsUsed, 3)
+  assert.equal(value.budget.stepsLimit, 10)
+  assert.equal(value.waveRuns.total, 0)
+  assert.equal(value.findings[0]?.severity, 'low')
+})
+
+test('harness_report surfaces a failed run_wave part as a finding, in the same session that ran it', async () => {
+  const { ctx, session } = await harness({ partStartStaggerMs: 0 })
+  ctx.provide('subagents', {
+    start: async (_provider: string, request: { label: string }) => ({
+      id: `child-${request.label}`,
+      localAgent: undefined,
+      result: Promise.resolve(request.label.endsWith(':docs')
+        ? { output: [], stopReason: 'completed', structured: { status: 'failed', summary: 'blocked on the name.' } }
+        : { output: [], stopReason: 'completed', structured: { status: 'done', summary: 'ok.' } }),
+      dispose: async () => {},
+    }),
+  } as never)
+  const runWave = ctx.tools.get(RUN_WAVE)
+  assert.ok(runWave !== undefined)
+  await runWave.execute({
+    parts: [
+      { id: 'core', task: 'Write the core module.', files: ['core.py'] },
+      { id: 'docs', task: 'Write the README.', files: ['README.md'] },
+    ],
+  }, { agent: { session } as unknown as Agent, signal: new AbortController().signal } as never)
+  const tool = ctx.tools.get(HARNESS_REPORT)
+  assert.ok(tool !== undefined)
+  const value = await tool.execute({}, { agent: { session } as unknown as Agent, signal: new AbortController().signal } as never) as {
+    waveRuns: { total: number; failed: number }
+    findings: { severity: string; summary: string; detail: string }[]
+  }
+  assert.equal(value.waveRuns.total, 2)
+  assert.equal(value.waveRuns.failed, 1)
+  const finding = value.findings.find(candidate => candidate.severity === 'high')
+  assert.ok(finding !== undefined)
+  assert.match(finding.detail, /docs \(wave 1\): blocked on the name\./u)
+})
+
+test('harness_report never writes anything and never changes the budget it reports on', async () => {
+  const { ctx, session } = await harness()
+  const tool = ctx.tools.get(HARNESS_REPORT)
+  assert.ok(tool !== undefined)
+  const first = await tool.execute({}, { agent: { session } as unknown as Agent, signal: new AbortController().signal } as never)
+  const second = await tool.execute({}, { agent: { session } as unknown as Agent, signal: new AbortController().signal } as never)
+  assert.deepEqual(first, second)
 })

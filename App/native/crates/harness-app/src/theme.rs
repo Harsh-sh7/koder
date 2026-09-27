@@ -80,11 +80,50 @@ pub const CARD_RADIUS: u8 = 12;
 
 pub const SIDEBAR: f32 = 236.0;
 
-/// Width of the right panel.
-pub const PANEL_WIDTH: f32 = 312.0;
-
 /// The gutter between the window edge and a floating card.
 pub const GUTTER: f32 = 8.0;
+
+/// Window width below which the sidebar folds into an icon rail.
+pub const RAIL_BELOW: f32 = 1040.0;
+
+/// Width of the folded sidebar: one column of marks, wide enough that the
+/// window's traffic lights, drawn into the content on macOS, stay inside it.
+pub const RAIL: f32 = 76.0;
+
+/// Narrowest the conversation card may get beside the session panel; below
+/// this the panel floats over the card instead of squeezing it.
+pub const CARD_MIN: f32 = 520.0;
+
+/// How wide each column of the window is, for one window width.
+///
+/// Every width is a function of the window rather than a constant, so the
+/// conversation card — the product's main surface — is what keeps its room
+/// when the window narrows, and the chrome is what gives way.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Columns {
+    /// Whether the sidebar is folded into an icon rail.
+    pub rail: bool,
+    /// Width of the sidebar, folded or not.
+    pub sidebar: f32,
+    /// Width of the session panel when it is open.
+    pub panel: f32,
+    /// The widest the file tree may be dragged.
+    pub tree_max: f32,
+}
+
+/// The column widths for a window.
+///
+/// @param width the window's content width in points
+/// @returns the widths every column is drawn at
+pub fn columns(width: f32) -> Columns {
+    let rail = width < RAIL_BELOW;
+    Columns {
+        rail,
+        sidebar: if rail { RAIL } else { (width * 0.17).clamp(200.0, SIDEBAR) },
+        panel: (width * 0.24).clamp(260.0, 340.0),
+        tree_max: (width * 0.28).clamp(160.0, 460.0),
+    }
+}
 
 /// Installs the theme on a context, at the configured font sizes.
 ///
@@ -664,11 +703,16 @@ pub fn list_row(
         );
     }
     // The contents are painted into the row's own rect, inset for the glyph.
+    // Their labels must not be selectable: a selectable label senses clicks and
+    // drags, so it would sit on top of the row, take the hover (the tint would
+    // blink off under the text) and turn a click on the text into a selection
+    // instead of the row's action.
     let mut content = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(rect.shrink2(Vec2::new(8.0, 0.0)))
             .layout(Layout::left_to_right(Align::Center)),
     );
+    content.style_mut().interaction.selectable_labels = false;
     add_contents(&mut content);
     response
 }
@@ -738,4 +782,42 @@ fn hash_hue(name: &str) -> (u8, u8, u8) {
         (0x5A, 0x9E, 0xE0),
     ];
     TINTS[(hash as usize) % TINTS.len()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_wide_window_keeps_the_full_sidebar_and_a_narrow_one_folds_it() {
+        let wide = columns(1480.0);
+        assert!(!wide.rail);
+        assert_eq!(wide.sidebar, SIDEBAR);
+        let narrow = columns(900.0);
+        assert!(narrow.rail);
+        assert_eq!(narrow.sidebar, RAIL);
+        // The fold happens exactly at the threshold, not a point later.
+        assert!(columns(RAIL_BELOW - 1.0).rail);
+        assert!(!columns(RAIL_BELOW).rail);
+    }
+
+    #[test]
+    fn every_column_stays_inside_its_bounds_at_every_width() {
+        for width in (600..=3000).step_by(20) {
+            let columns = columns(width as f32);
+            assert!((260.0..=340.0).contains(&columns.panel), "panel at {width}");
+            assert!((160.0..=460.0).contains(&columns.tree_max), "tree at {width}");
+            assert!(columns.sidebar <= SIDEBAR, "sidebar at {width}");
+        }
+    }
+
+    #[test]
+    fn the_default_window_docks_the_panel_beside_a_card_of_at_least_the_minimum() {
+        // The shell docks the panel only while the card keeps CARD_MIN; at the
+        // default window that must hold, or the product opens with a float.
+        let width = 1480.0;
+        let columns = columns(width);
+        let card = width - columns.sidebar - columns.panel - 12.0 - 2.0 * GUTTER;
+        assert!(card >= CARD_MIN, "card would be {card}");
+    }
 }

@@ -49,9 +49,10 @@ make app-release          # the native window (release — this is what a demo u
   prerequisite for the app.
 - `make setup` is idempotent. Re-run it after moving the checkout: the profile's
   `link:` dependencies are rewritten to the new absolute paths.
-- No model is configured by default. Add one in the app's model dialog (`⌘,`) or
-  by writing `.harness/models.json`. Until then sessions open on the provider's
-  placeholder route and prompts fail immediately with a clear message.
+- The default model is OpenRouter's DeepSeek; `AI_MODEL`/`AI_BASE_URL` in
+  `.env` choose another, and a route added in the app's model dialog (`⌘,`,
+  written to `.harness/models.json`) wins over both. Without `AI_API_KEY`,
+  prompts fail immediately with a clear message.
 
 ## 3. The rules (compliance — breaking one of these fails the deliverable)
 

@@ -79,6 +79,26 @@ pub enum Icon {
     Gauge,
     /// Three dots: more actions.
     More,
+    /// An arrow pointing left: back.
+    ArrowLeft,
+    /// An arrow pointing right: forward.
+    ArrowRight,
+    /// An arrow pointing down: jump to the latest.
+    ArrowDown,
+    /// A lightning bolt: quick actions.
+    Bolt,
+    /// Three lines with bullets: a list.
+    List,
+    /// A panel with a bottom strip: the terminal drawer.
+    PanelBottom,
+    /// A panel with a right column: the session panel.
+    PanelRight,
+    /// A filled square: stop.
+    Stop,
+    /// A cross: close, failed.
+    Cross,
+    /// A plug: an MCP server.
+    Plug,
 }
 
 /// Draws one glyph and returns its rectangle as a widget slot.
@@ -138,6 +158,16 @@ pub fn paint(ui: &Ui, icon: Icon, rect: Rect, colour: Color32) {
         Icon::Branch => pen.branch(),
         Icon::Gauge => pen.gauge(),
         Icon::More => pen.more(),
+        Icon::ArrowLeft => pen.arrow_left(),
+        Icon::ArrowRight => pen.arrow_right(),
+        Icon::ArrowDown => pen.arrow_down(),
+        Icon::Bolt => pen.bolt(),
+        Icon::List => pen.list(),
+        Icon::PanelBottom => pen.panel_bottom(),
+        Icon::PanelRight => pen.panel_right(),
+        Icon::Stop => pen.stop(),
+        Icon::Cross => pen.cross(),
+        Icon::Plug => pen.plug(),
     }
 }
 
@@ -479,6 +509,71 @@ impl Pen<'_> {
     fn arrow_up(&self) {
         self.seg(0.5, 0.80, 0.5, 0.22);
         self.line(&[(0.30, 0.42), (0.5, 0.22), (0.70, 0.42)]);
+    }
+
+    /// An arrow pointing down.
+    fn arrow_down(&self) {
+        self.seg(0.5, 0.20, 0.5, 0.78);
+        self.line(&[(0.30, 0.58), (0.5, 0.78), (0.70, 0.58)]);
+    }
+
+    /// An arrow pointing left.
+    fn arrow_left(&self) {
+        self.seg(0.80, 0.5, 0.22, 0.5);
+        self.line(&[(0.42, 0.30), (0.22, 0.5), (0.42, 0.70)]);
+    }
+
+    /// An arrow pointing right.
+    fn arrow_right(&self) {
+        self.seg(0.20, 0.5, 0.78, 0.5);
+        self.line(&[(0.58, 0.30), (0.78, 0.5), (0.58, 0.70)]);
+    }
+
+    /// A lightning bolt.
+    fn bolt(&self) {
+        self.line(&[(0.58, 0.12), (0.28, 0.54), (0.50, 0.54), (0.42, 0.88), (0.72, 0.44), (0.50, 0.44), (0.58, 0.12)]);
+    }
+
+    /// Three bulleted lines.
+    fn list(&self) {
+        for y in [0.30, 0.50, 0.70] {
+            self.painter
+                .circle_filled(self.at(0.22, y), self.rect.width() * 0.045, self.colour);
+            self.seg(0.36, y, 0.82, y);
+        }
+    }
+
+    /// A frame with a bottom strip.
+    fn panel_bottom(&self) {
+        self.frame((0.12, 0.18), (0.88, 0.82), 2.0);
+        self.seg(0.12, 0.60, 0.88, 0.60);
+    }
+
+    /// A frame with a right column.
+    fn panel_right(&self) {
+        self.frame((0.12, 0.18), (0.88, 0.82), 2.0);
+        self.seg(0.62, 0.18, 0.62, 0.82);
+    }
+
+    /// A filled rounded square.
+    fn stop(&self) {
+        let rect = Rect::from_min_max(self.at(0.28, 0.28), self.at(0.72, 0.72));
+        self.painter
+            .rect_filled(rect, CornerRadius::same(2), self.colour);
+    }
+
+    /// A diagonal cross.
+    fn cross(&self) {
+        self.seg(0.28, 0.28, 0.72, 0.72);
+        self.seg(0.72, 0.28, 0.28, 0.72);
+    }
+
+    /// A plug: a body, two prongs, a cord.
+    fn plug(&self) {
+        self.frame((0.30, 0.36), (0.70, 0.62), 2.0);
+        self.seg(0.40, 0.18, 0.40, 0.36);
+        self.seg(0.60, 0.18, 0.60, 0.36);
+        self.seg(0.50, 0.62, 0.50, 0.84);
     }
 
     /// A gear: a ring with teeth.

@@ -59,12 +59,14 @@ export function bootEngine(options) {
     '--profile', options.profile ?? 'harness',
     ...patch === undefined ? [] : ['--patch', patch],
   ]
-  const child = spawn(process.execPath, args, {
+  const child = spawn(process.execPath, options.launcher === undefined ? args : [options.launcher], {
     cwd: workspace,
     env: {
       ...process.env,
       TSX_TSCONFIG_PATH: resolve(dshRepo, 'tsconfig.json'),
       DSH_HOME: process.env.DSH_HOME ?? resolve(workspace, '.dsh'),
+      ...options.env,
+      HARNESS_WORKSPACE: workspace,
     },
     stdio: ['pipe', 'pipe', 'pipe'],
   })
@@ -79,7 +81,17 @@ export function bootEngine(options) {
     const message = { jsonrpc: '2.0', id, method, params }
     if (echo) process.stdout.write(`--> ${JSON.stringify(message)}\n`)
     child.stdin.write(`${JSON.stringify(message)}\n`)
-    return new Promise((resolvePromise, reject) => pending.set(id, { resolve: resolvePromise, reject, method }))
+    return new Promise((resolvePromise, reject) => {
+      const timer = setTimeout(() => {
+        pending.delete(id)
+        reject(new Error(`${method}: timed out`))
+      }, options.timeoutMs ?? 90_000)
+      pending.set(id, {
+        resolve: value => { clearTimeout(timer); resolvePromise(value) },
+        reject: error => { clearTimeout(timer); reject(error) },
+        method,
+      })
+    })
   }
 
   const respond = (id, result) => {
@@ -114,6 +126,15 @@ export function bootEngine(options) {
     else waiter.resolve(message.result)
   })
 
+  const exited = new Promise(resolve => child.once('exit', code => {
+    for (const waiter of pending.values()) waiter.reject(new Error(`engine exited (${code}) during ${waiter.method}`))
+    pending.clear()
+    resolve(code)
+  }))
+  child.on('error', error => {
+    for (const waiter of pending.values()) waiter.reject(error)
+    pending.clear()
+  })
   const stderr = []
   child.stderr.on('data', (chunk) => {
     stderr.push(String(chunk))
@@ -131,7 +152,8 @@ export function bootEngine(options) {
       .map(message => message.params.update),
     async close() {
       child.stdin.end()
-      return await new Promise(resolvePromise => child.once('exit', code => resolvePromise(code)))
+      const timer = setTimeout(() => { child.kill('SIGTERM') }, 8_000)
+      try { return await exited } finally { clearTimeout(timer) }
     },
   }
 }

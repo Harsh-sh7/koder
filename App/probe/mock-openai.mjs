@@ -13,20 +13,123 @@
 //            reflects the newest), a `subagent` delegation, a created file, an
 //            `edit` of it, and a command held open — the panel's two lists and
 //            the transcript's delegation, change, and to-do cards with live rows.
+//   --build  exercises run_wave end to end: the parent hands three parts to the
+//            harness, each part's child writes its own file and reports through
+//            structured_output, and the parent closes with a rich markdown answer
+//            (headings, lists, a table, code, a mermaid block, an ASCII diagram).
 //   --fail   answers every request with the 429 body OpenRouter returns when a
 //            free route's shared pool is exhausted, so the failure path — the
 //            message the app shows and the retry it offers — is provable too.
 
 import { createServer } from 'node:http'
+import { appendFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 
 const argv = process.argv.slice(2)
 const portIndex = argv.indexOf('--port')
+const recordIndex = argv.indexOf('--record')
+const recordPath = recordIndex === -1 ? undefined : argv[recordIndex + 1]
 const port = portIndex === -1 ? 8899 : Number(argv[portIndex + 1])
 const useTool = argv.includes('--tool')
 const useSpec = argv.includes('--spec')
 const useWave = argv.includes('--wave')
 const usePanel = argv.includes('--panel')
 const failMode = argv.includes('--fail')
+const useBuild = argv.includes('--build')
+
+/** The parts the build mode hands to run_wave, by id: the file each owns. */
+const BUILD_PARTS = {
+  core: '.harness/ui-check/todo.py',
+  tests: '.harness/ui-check/test_todo.py',
+  docs: '.harness/ui-check/README.md',
+}
+
+/** The answer the build mode closes with: every markdown shape the transcript draws. */
+const BUILD_ANSWER = [
+  '## Todo CLI is built',
+  '',
+  'Three parts ran as **parallel subagents**, each confined to its own file; the `run_wave` result above has one line per part.',
+  '',
+  '### What changed',
+  '',
+  '- `todo.py` — `add`, `list`, and `done` commands over a JSON store',
+  '- `test_todo.py` — 6 tests, including the empty and malformed cases',
+  '- `README.md` — how to run it',
+  '',
+  '1. Parse the command',
+  '2. Load the store',
+  '    - create it when missing',
+  '3. Apply and save',
+  '',
+  '| Part | File | Check | Result |',
+  '| --- | --- | --- | --- |',
+  '| core | todo.py | `python todo.py list` | pass |',
+  '| tests | test_todo.py | `pytest -q` | 6 passed |',
+  '| docs | README.md | — | written |',
+  '',
+  '> Verified by running both checks after the wave settled.',
+  '',
+  '```python',
+  'def add(store: list[dict], title: str) -> dict:',
+  '    """Add a todo; blank titles are refused."""',
+  '    if not title.strip():',
+  '        raise ValueError("a todo needs a title")',
+  '    item = {"id": len(store) + 1, "title": title.strip(), "done": False}',
+  '    store.append(item)',
+  '    return item',
+  '```',
+  '',
+  '```mermaid',
+  'flowchart LR',
+  '  CLI[todo.py] -->|reads| Store[(todos.json)]',
+  '  Tests[test_todo.py] --> CLI',
+  '```',
+  '',
+  '```text',
+  '+---------+     +-------------+     +------------+',
+  '|  add    | --> |  todos.json | <-- |  list/done |',
+  '+---------+     +-------------+     +------------+',
+  '```',
+].join('\n')
+
+/**
+ * The reply for one request in build mode.
+ *
+ * Parent and children are told apart by what they were offered: only a
+ * structured child has `structured_output`. Every decision is read off the
+ * request itself, because the children run at the same time and a shared
+ * counter would interleave them.
+ *
+ * @param body the request
+ * @returns a reply in the shape `replyFor` expects
+ */
+function buildReply(body) {
+  const messages = body.messages ?? []
+  const text = JSON.stringify(messages)
+  const offered = (body.tools ?? []).map(tool => tool.function?.name)
+  const toolResults = messages.filter(message => message.role === 'tool').length
+  const call = (id, name, args) => ({ toolCall: { id, type: 'function', function: { name, arguments: JSON.stringify(args) } } })
+  if (offered.includes('structured_output')) {
+    const part = /Your part, \\?"([a-z]+)\\?"/u.exec(text)?.[1] ?? 'core'
+    process.stdout.write(`build-mode: child ${part} step ${String(toolResults + 1)}\n`)
+    if (toolResults === 0) {
+      return call(`call_write_${part}`, 'write', { file_path: BUILD_PARTS[part], content: `# ${part}\n\nbuilt by the ${part} part\n` })
+    }
+    return call(`call_done_${part}`, 'structured_output', { status: 'done', summary: `${BUILD_PARTS[part]} written; its check passed.` })
+  }
+  if (toolResults === 0) {
+    process.stdout.write('build-mode: parent run_wave\n')
+    return call('call_run_wave_1', 'run_wave', {
+      parts: [
+        { id: 'core', task: 'Write the todo CLI with add, list and done.', files: [BUILD_PARTS.core], check: 'python todo.py list' },
+        { id: 'tests', task: 'Write pytest tests for the CLI, including empty and malformed input.', files: [BUILD_PARTS.tests], check: 'pytest -q' },
+        { id: 'docs', task: 'Write a README that says how to run the CLI and its tests.', files: [BUILD_PARTS.docs] },
+      ],
+    })
+  }
+  process.stdout.write('build-mode: parent answer\n')
+  return { text: BUILD_ANSWER }
+}
 
 /** The replacement spec the mock proposes; the probe greps the log for it. */
 const AMENDED_SPEC = 'Amended frozen spec: build the terminal harness with a live token meter.'
@@ -247,6 +350,7 @@ function replyFor(body) {
     }
     return { text: 'Spec-lock flow complete.' }
   }
+  if (useBuild) return buildReply(body)
   if (useTool && !sawToolResult) {
     return {
       toolCall: {
@@ -272,6 +376,10 @@ const server = createServer((request, response) => {
   request.on('data', (piece) => chunks.push(piece))
   request.on('end', () => {
     const body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+    if (recordPath) appendFileSync(recordPath, JSON.stringify({
+      body,
+      credentialHash: createHash('sha256').update(request.headers.authorization ?? '').digest('hex'),
+    }) + '\n')
     if (failMode) {
       // The body is OpenRouter's, byte for byte in shape: the app's own message
       // has to survive a real provider's error, not a tidy one.
@@ -329,5 +437,5 @@ const server = createServer((request, response) => {
 })
 
 server.listen(port, '127.0.0.1', () => {
-  process.stdout.write(`mock OpenAI listening on http://127.0.0.1:${port}/v1 (tool mode: ${useTool})\n`)
+  process.stdout.write(`mock OpenAI listening on http://127.0.0.1:${server.address().port}/v1 (tool mode: ${useTool})\n`)
 })

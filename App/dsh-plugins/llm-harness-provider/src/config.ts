@@ -9,6 +9,8 @@
  * @module @harness/dsh-llm-harness-provider/config
  */
 
+import { validateBaseURL } from './document.ts'
+
 import type { Volatile } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { credentialRef, type CredentialRef } from '@deepseek-ai/dsh-credentials'
@@ -20,6 +22,33 @@ export const DEFAULT_MODELS_FILE = '.harness/models.json'
 export const DEFAULT_API_KEY_ENV = 'AI_API_KEY'
 /** Route key of the `cordis.yml` fallback route. */
 export const DEFAULT_ROUTE = 'default'
+/**
+ * Output tokens one response may use, for any route that declares neither its
+ * own `defaultMaxTokens` nor a per-model `maxTokens`.
+ *
+ * dsh's own fallback, applied at exactly that point, is 32768 — larger than
+ * some providers' real per-model ceiling even though it is well under the
+ * model's context window (Groq is one: it rejects the request outright rather
+ * than clamping it). This is deliberately conservative instead, and is what
+ * makes a route someone adds through the model dialog — not only the
+ * `cordis.yml` fallback — safe by default on such a provider.
+ */
+export const DEFAULT_MAX_TOKENS = 8_192
+
+/**
+ * The configured output-token cap, from `AI_MAX_TOKENS` — read directly from
+ * the process environment because it is a plain tuning number, not a
+ * credential, and this plugin already runs inside the engine process
+ * `run-acp.mjs` set it in.
+ * @returns the configured value, or {@link DEFAULT_MAX_TOKENS} when unset or unparsable.
+ */
+export function resolveDefaultMaxTokens(): number {
+  const raw = process.env.AI_MAX_TOKENS?.trim()
+  if (raw === undefined || raw.length === 0) return DEFAULT_MAX_TOKENS
+  const parsed = Number(raw)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_TOKENS
+}
+
 /** Route key of the placeholder served when no route is declared anywhere. */
 export const UNCONFIGURED_ROUTE = 'unconfigured'
 /** Display name of the placeholder route. */
@@ -111,6 +140,7 @@ export interface ResolvedOptions {
  * @returns the profile, with one model entry named after the model id.
  */
 export function fallbackProfile(route: string, input: DefaultRouteInput): PiAiProviderProfile {
+  validateBaseURL(input.baseURL)
   return {
     displayName: input.displayName ?? route,
     api: input.api ?? 'openai-completions',
@@ -158,12 +188,41 @@ export function unconfiguredProfile(): PiAiProviderProfile {
 export function routeProfiles(
   fallback: { route: string; profile: PiAiProviderProfile } | undefined,
   document: Record<string, PiAiProviderProfile>,
+  defaultMaxTokens: number = resolveDefaultMaxTokens(),
 ): Record<string, PiAiProviderProfile> {
   const declared = {
     ...fallback === undefined ? {} : { [fallback.route]: fallback.profile },
     ...document,
   }
-  return Object.keys(declared).length === 0 ? { [UNCONFIGURED_ROUTE]: unconfiguredProfile() } : declared
+  if (Object.keys(declared).length === 0) return { [UNCONFIGURED_ROUTE]: unconfiguredProfile() }
+  // A model that names no output cap of its own gets this harness's
+  // conservative one, so a route added through the model dialog — not only
+  // the cordis.yml fallback — is safe by default on a provider like Groq.
+  //
+  // This has to be a per-MODEL `maxTokens`, not the profile's own
+  // `defaultMaxTokens`: only a per-model cap becomes the adapter's
+  // `configuredMaxTokens` and so the agent loop's actual request default
+  // (`llm-pi-ai/adapter.ts`'s `modelInfo` — "Only a cap the deployment
+  // configured is a request default; the catalog's `maxTokens` sizes the
+  // model and stops there"). A route-level `defaultMaxTokens` only sizes the
+  // catalog's own bookkeeping and never reaches the wire request at all,
+  // which is exactly the shape this bug took: the field was set, correctly,
+  // and still had no effect. `models` omitted entirely (the route serves
+  // dsh's installed catalog as-is) is left alone — that catalog's own
+  // capacities are real capabilities, not a gap to fill.
+  return Object.fromEntries(
+    Object.entries(declared).map(([route, profile]) => [
+      route,
+      profile.models === undefined
+        ? profile
+        : {
+          ...profile,
+          models: profile.models.map(model => (
+            model.maxTokens === undefined ? { ...model, maxTokens: defaultMaxTokens } : model
+          )),
+        },
+    ]),
+  )
 }
 
 /**

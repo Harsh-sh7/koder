@@ -9,7 +9,7 @@
 import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
 
-import { decideBudget, formatCount, totalTokens } from '../src/budget.ts'
+import { decideBudget, formatCount, totalTokens, weightedTokens } from '../src/budget.ts'
 import type { BudgetLimits } from '../src/budget.ts'
 
 const limits: BudgetLimits = { tokens: 1_000, stepsPerTurn: 5, warnAt: 0.8 }
@@ -22,6 +22,13 @@ function decide(tokens: number, stepsInTurn = 1, overrides: Partial<BudgetLimits
 test('every bucket counts toward the spend', () => {
   assert.equal(totalTokens({ uncachedInputTokens: 10, outputTokens: 20, cacheReadTokens: 300, cacheWriteTokens: 4 }), 334)
   assert.equal(totalTokens({ uncachedInputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }), 0)
+})
+
+test('cache reads count at their weight, every other bucket in full', () => {
+  const totals = { uncachedInputTokens: 10, outputTokens: 20, cacheReadTokens: 300, cacheWriteTokens: 4 }
+  assert.equal(weightedTokens(totals, 0.1), 64)
+  assert.equal(weightedTokens(totals, 1), totalTokens(totals))
+  assert.equal(weightedTokens(totals, 0), 34)
 })
 
 test('counts print the same digits on every host', () => {
@@ -52,10 +59,24 @@ test('the ceiling outranks the warning and the step cap', () => {
   assert.equal(spent.kind, 'stop')
   assert.equal(spent.kind === 'stop' ? spent.over : undefined, 'tokens')
   assert.match(spent.kind === 'stop' ? spent.text : '', /Session budget exhausted: 1,000 of 1,000 model tokens spent/u)
+  // A turn-scoped ceiling names itself, so the stop reads as what it is.
+  const turn = decide(1_000, 1, { scope: 'turn' })
+  assert.match(turn.kind === 'stop' ? turn.text : '', /^Turn budget exhausted/u)
+})
+
+test('the step cap warns at the same fraction, and a token warning outranks it', () => {
+  // 80% of a 5-step turn is step 4: the model is told to converge before the cut.
+  assert.equal(decide(0, 3).kind, 'ok')
+  const late = decide(0, 4)
+  assert.equal(late.kind, 'warn')
+  assert.equal(late.kind === 'warn' ? late.over : undefined, 'steps')
+  assert.match(late.kind === 'warn' ? late.text : '', /step 4 of a 5-step turn\. Converge now/u)
+  const both = decide(800, 4)
+  assert.equal(both.kind === 'warn' ? both.over : undefined, 'tokens')
 })
 
 test('the turn step cap stops one turn and the last allowed step still runs', () => {
-  assert.equal(decide(0, 5).kind, 'ok')
+  assert.notEqual(decide(0, 5).kind, 'stop')
   const over = decide(0, 6)
   assert.equal(over.kind, 'stop')
   assert.equal(over.kind === 'stop' ? over.over : undefined, 'steps')

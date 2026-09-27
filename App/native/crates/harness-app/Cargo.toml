@@ -19,5 +19,8 @@ env_logger.workspace = true
 crossbeam-channel = "0.5.17"
 eframe = { version = "0.36.2", default-features = false, features = ["wgpu", "default_fonts"] }
 egui_extras = "0.36.2"
+# Markdown for the agent's answers: tables, lists, headings, quotes. Images are
+# off — model I/O is text-only — so no image loaders are pulled in.
+egui_commonmark = { version = "0.25", default-features = false, features = ["pulldown_cmark"] }
 rfd = "0.17.2"
 chrono = "0.4.45"

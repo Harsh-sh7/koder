@@ -7,19 +7,29 @@
 #
 # Two decisions live here:
 #
-# 1. Route ownership. Every model route comes from the workspace models document
-#    (`.harness/models.json`) through this repository's provider plugin, so the
-#    shipped DeepSeek routes are mounted off. Adding a model in the application
-#    is then the only way a route appears, and `AI_API_KEY` — the key the
-#    workspace declares — is the only credential any route can read.
+# 1. Route ownership. Every model route comes from this repository's provider
+#    plugin, so the shipped DeepSeek routes are mounted off, and `AI_API_KEY` is
+#    the only credential any route can read.
 # 2. The harness itself: the frozen session spec, the operating contract, the
 #    wave/committee tools, and the budget the harness enforces rather than the
 #    model.
 #
-# Environment overrides, for a deployment that must not edit source:
-#   AI_HARNESS_FALLBACK_MODEL / AI_HARNESS_FALLBACK_BASE_URL — declare a fallback
-#   route for a workspace nobody has configured yet. Left unset (the default),
-#   the harness ships no model at all: the application is where one is added.
+# THE MODEL. A clean clone runs with nothing but AI_API_KEY: the default route
+# is OpenRouter's DeepSeek. Pick another model without touching this file:
+#   AI_MODEL          model id at the endpoint   (default deepseek/deepseek-v4-flash;
+#                     e.g. qwen/qwen3.7-plus, deepseek/deepseek-v4-pro)
+#   AI_BASE_URL       OpenAI-compatible API root (default https://openrouter.ai/api/v1)
+#   AI_CONTEXT_WINDOW working context the harness compacts within (default 131072)
+#   AI_MAX_TOKENS     output tokens one response may use     (default 8192)
+#                     — raise this for a route that allows more; some providers
+#                     (Groq is one) reject a request above their own per-model
+#                     ceiling even though it is well under the context window,
+#                     so the default here is deliberately conservative rather
+#                     than dsh's own 32768 fallback.
+# — in the environment or in the repository's .env. A workspace's
+# .harness/models.json `active` route (what the application writes) wins over
+# this default. AI_HARNESS_FALLBACK_MODEL / _BASE_URL are older names for the
+# first two and are still honoured.
 
 - id: llm-pi-ai
   disabled: true
@@ -38,6 +48,39 @@
 - id: plugin-package-inventory-deepseek
   disabled: true
 
+# Tools an issue-fixing agent never needs. Each one rides every request as a
+# schema (and several as a system-prompt paragraph): together about 11k chars —
+# roughly 3k tokens, 40% of the fixed per-request prefix — measured against the
+# engine's own request. Some are also hazards in an unattended run: plan mode
+# parks the turn on an approval nobody answers, goal rounds re-arm themselves,
+# web search needs a DeepSeek-branded credential this harness never reads, and
+# read_image is an image path to a text-only model. A profile patch can turn any
+# of them back on.
+- id: tool-workflow
+  disabled: true
+- id: workflow-ptc
+  disabled: true
+- id: tool-subagent-fork
+  disabled: true
+- id: tool-subagent-control
+  disabled: true
+- id: tool-subagent-list-agents
+  disabled: true
+- id: goal
+  disabled: true
+- id: goal-round-driver
+  disabled: true
+- id: command-goal
+  disabled: true
+- id: tool-goal
+  disabled: true
+- id: plan-mode
+  disabled: true
+- id: tool-web
+  disabled: true
+- id: attachment-local
+  disabled: true
+
 - insert:
     # The single route source. The document is re-read when its bytes change, so
     # a model added in the application reaches the next request without a restart.
@@ -46,9 +89,12 @@
       config:
         modelsFile: .harness/models.json
         apiKeyEnv: AI_API_KEY
-        # Both variables or neither: a model id with no endpoint, or the reverse,
-        # is a half-declared route and half-declared routes fail loud.
-        defaultRoute: !!js "process.env.AI_HARNESS_FALLBACK_MODEL && process.env.AI_HARNESS_FALLBACK_BASE_URL ? { displayName: process.env.AI_HARNESS_FALLBACK_MODEL, baseURL: process.env.AI_HARNESS_FALLBACK_BASE_URL, model: process.env.AI_HARNESS_FALLBACK_MODEL } : undefined"
+        # The default route (see THE MODEL above). The advertised context window
+        # is deliberately smaller than what large-context routes accept: it is
+        # the window compaction works within, and an agent loop re-sends its
+        # whole context on every step, so an unbounded window is paid for again
+        # and again.
+        defaultRoute: !!js "({ displayName: process.env.AI_MODEL || process.env.AI_HARNESS_FALLBACK_MODEL || 'deepseek/deepseek-v4-flash', baseURL: process.env.AI_BASE_URL || process.env.AI_HARNESS_FALLBACK_BASE_URL || 'https://openrouter.ai/api/v1', model: process.env.AI_MODEL || process.env.AI_HARNESS_FALLBACK_MODEL || 'deepseek/deepseek-v4-flash', contextWindow: Number(process.env.AI_CONTEXT_WINDOW || 131072), maxTokens: Number(process.env.AI_MAX_TOKENS || 8192) })"
 
     # The session's opening instruction stays frozen: restated whenever context
     # management drops it, amendable only with the user's approval, and readable
@@ -62,18 +108,29 @@
     - id: harness-preset
       name: '@harness/dsh-hackathon-harness-preset'
       config:
-        # Model tokens one session may spend before the harness stops it, and the
-        # fraction at which it warns the model once. The warning is the useful
-        # half: it tells the model to land the subtask in flight.
-        maxTokens: 400000
+        # Weighted model tokens one prompt (one issue) may spend before the
+        # harness stops it, and the fraction at which it warns the model once.
+        # The warning is the useful half: it tells the model to land the
+        # subtask in flight. Prompt-cache reads count at cacheReadWeight: an
+        # agent loop re-reads its whole prefix every step, and at full weight a
+        # cheap, cached turn hit the old 400k session cap after ~15 steps.
+        maxTokens: 1500000
         warnAt: 0.8
+        budgetScope: turn
+        cacheReadWeight: 0.1
         # Steps one turn may take, so a runaway loop is bounded even when nothing
-        # it reads is expensive.
-        stepsPerTurn: 60
+        # it reads is expensive. The step cap also warns at warnAt, so the model
+        # converges and reports instead of being cut off mid-edit.
+        stepsPerTurn: 90
         # Approved escalations past the ceiling, and the tokens each one buys.
         maxEscalations: 2
-        grantTokens: 200000
+        grantTokens: 500000
         # Reviewers are seated as fresh children: a fork would hand every reviewer
         # the parent's whole context, and paying for that context three times is
         # exactly the cost the committee exists to avoid.
         committeeProvider: spawn
+        # Sampling temperature for every request, from AI_TEMPERATURE (e.g. in
+        # .env). Unset, the route's default applies. Vendors differ — DeepSeek
+        # advises low values for code, Qwen's coder models ~0.7 — so measure it
+        # on the practice issues before pinning it.
+        temperature: !!js "process.env.AI_TEMPERATURE ? Number(process.env.AI_TEMPERATURE) : undefined"

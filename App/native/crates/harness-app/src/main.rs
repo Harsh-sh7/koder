@@ -50,6 +50,9 @@ struct Cli {
     /// A dialog to open on, when the caller named one. Like `--pane`, this
     /// exists so a test can photograph a card without a person clicking to it.
     dialog: Option<String>,
+    /// The window's opening size, so a test can photograph the layout at a
+    /// narrow width without a person dragging the window edge.
+    size: Option<[f32; 2]>,
 }
 
 impl Default for Cli {
@@ -64,6 +67,7 @@ impl Default for Cli {
             shot_delay: 3.0,
             pane: None,
             dialog: None,
+            size: None,
         }
     }
 }
@@ -102,6 +106,10 @@ impl Cli {
                     Some(value) => cli.dialog = Some(value),
                     None => ignored.push("--dialog without a name".to_string()),
                 },
+                "--size" => match args.next().as_deref().and_then(parse_size) {
+                    Some(size) => cli.size = Some(size),
+                    None => ignored.push("--size without WIDTHxHEIGHT".to_string()),
+                },
                 "--check" => cli.check = true,
                 "--engine" => cli.engine = true,
                 "--ask" => match args.next() {
@@ -119,6 +127,22 @@ impl Cli {
     }
 }
 
+/// The narrowest window the layout is drawn for, in points.
+const MIN_WIDTH: f32 = 640.0;
+/// The shortest window the layout is drawn for, in points.
+const MIN_HEIGHT: f32 = 480.0;
+
+/// Parses a `WIDTHxHEIGHT` size, clamped to the window's floor.
+///
+/// @param value the argument, e.g. `900x600`
+/// @returns the size, or nothing when it does not parse
+fn parse_size(value: &str) -> Option<[f32; 2]> {
+    let (width, height) = value.split_once(['x', 'X'])?;
+    let width = width.trim().parse::<f32>().ok()?;
+    let height = height.trim().parse::<f32>().ok()?;
+    Some([width.max(MIN_WIDTH), height.max(MIN_HEIGHT)])
+}
+
 /// What `--help` prints.
 const USAGE: &str = "\
 AI Harness — a terminal-first coding harness with an agent that works in it.
@@ -126,7 +150,7 @@ AI Harness — a terminal-first coding harness with an agent that works in it.
 usage: ai-harness [--workspace <dir>] [--dsh-home <dir>] [--ask <prompt>]
                   [--check [--engine]]
                   [--shot <file.ppm> [--shot-delay <seconds>]] [--pane <view>]
-                  [--dialog <models|folder>]
+                  [--dialog <models|folder>] [--size <width>x<height>]
 
   --workspace <dir>  open this directory instead of the current one
   --dsh-home <dir>   harness home holding the engine profile and its state
@@ -138,6 +162,7 @@ usage: ai-harness [--workspace <dir>] [--dsh-home <dir>] [--ask <prompt>]
   --pane <view>      open on a view: conversation, terminal, editor, git,
                      workflows, or observability (also term, code, flow, meter)
   --dialog <name>    open on a dialog: models, or folder
+  --size <w>x<h>     open the window at this size in points (e.g. 720x560)
 
 keys
   ⌘K / Ctrl+K        command palette          ⌘P / Ctrl+P    go to file
@@ -173,8 +198,15 @@ fn main() -> eframe::Result {
     let title = format!("AI Harness — {}", workspace.display());
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1480.0, 940.0])
-            .with_min_inner_size([900.0, 560.0])
+            .with_inner_size(cli.size.unwrap_or([1480.0, 940.0]))
+            // The layout folds (icon-rail sidebar, overlaid session panel) far
+            // below the comfortable size, so the floor only guards the composer.
+            .with_min_inner_size([MIN_WIDTH, MIN_HEIGHT])
+            // The reference client draws its own chrome: the traffic lights sit
+            // in the sidebar's corner and the title row is the drag handle.
+            .with_fullsize_content_view(true)
+            .with_titlebar_shown(false)
+            .with_title_shown(false)
             .with_title(title),
         ..Default::default()
     };

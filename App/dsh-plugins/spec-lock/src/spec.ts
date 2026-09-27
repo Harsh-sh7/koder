@@ -58,6 +58,13 @@ export const DEFAULT_MAX_INLINE_CHARS = 1500
 /** Default for {@link Config.minChars}: every non-empty text qualifies. */
 export const DEFAULT_MIN_CHARS = 1
 
+/**
+ * Default for {@link Config.refreezeMinChars}: a later user prompt at least this
+ * long is a new task and replaces the spec. Shorter ones ("continue", "yes,
+ * do that") are follow-ups on the current spec and leave it alone.
+ */
+export const DEFAULT_REFREEZE_MIN_CHARS = 80
+
 /** Fold state of one session's frozen spec. Plain JSON: the projection cache persists it. */
 export interface SpecLockState {
   /** The frozen spec text, or null while no message has qualified. */
@@ -138,12 +145,23 @@ export function messageText(message: { readonly content: readonly ContentBlock[]
  * context-injected user messages — this plugin's restatements included — cannot
  * become the spec. An approved amendment, marked in its own source, replaces
  * the text; a restatement never does.
+ *
+ * With `refreezeMinChars` set, a later user-authored message at least that long
+ * is a new task and re-freezes the spec. One session is routinely handed one
+ * issue after another; freezing only the first would restate issue one into the
+ * fortieth issue's context and hold every later issue to the first one's text.
  * @param state - the state covering all earlier events.
  * @param event - the next committed event.
  * @param minChars - shortest text a message may freeze with.
+ * @param refreezeMinChars - shortest later message that replaces the spec; undefined never replaces it.
  * @returns the next state, the same reference when this event changes nothing.
  */
-export function applySpecLockEvent(state: SpecLockState, event: SessionEvent, minChars: number): SpecLockState {
+export function applySpecLockEvent(
+  state: SpecLockState,
+  event: SessionEvent,
+  minChars: number,
+  refreezeMinChars?: number,
+): SpecLockState {
   if (event.type !== 'user/message') return state
   const source = event.data.source
   if (source.kind === SPEC_LOCK_SOURCE) {
@@ -159,9 +177,14 @@ export function applySpecLockEvent(state: SpecLockState, event: SessionEvent, mi
       amendments: state.amendments + 1,
     }
   }
-  if (source.kind !== 'user' || state.text !== null) return state
+  if (source.kind !== 'user') return state
   const text = messageText(event.data)
-  if (text.length < minChars) return state
+  if (state.text !== null) {
+    if (refreezeMinChars === undefined || text.length < Math.max(refreezeMinChars, minChars)) return state
+    if (text === state.text) return state
+  } else if (text.length < minChars) {
+    return state
+  }
   return { text, digest: digestOf(text), chars: text.length, lockedAt: event.time, amendedAt: null, amendments: 0 }
 }
 
@@ -236,18 +259,21 @@ export type SpecLockProjection = ProjectionDefinition<'specLock', SpecLockState>
 /**
  * The `specLock` projection: one session's spec folded out of its own history.
  * @param minChars - shortest text a message may freeze with.
+ * @param refreezeMinChars - shortest later message that replaces the spec; undefined never replaces it.
  * @returns the definition to register.
  */
-export function specLockProjection(minChars: number): SpecLockProjection {
+export function specLockProjection(minChars: number, refreezeMinChars?: number): SpecLockProjection {
   // The change feed compares raw view results with Object.is, so one state must
   // render one object; folding identity is what memoizes it.
   const views = new WeakMap<SpecLockState, SpecLockView>()
   return {
     key: 'specLock',
-    stateVersion: 1,
+    // Version 2: later substantial prompts re-freeze the spec, so a state
+    // cached under the first-message-only fold must be recomputed.
+    stateVersion: 2,
     stateSchema: specLockStateSchema,
     init: () => emptySpecLockState(),
-    apply: (state, event) => applySpecLockEvent(state, event, minChars),
+    apply: (state, event) => applySpecLockEvent(state, event, minChars, refreezeMinChars),
     wire: {
       viewSchema: specLockViewSchema,
       view: (state) => {
